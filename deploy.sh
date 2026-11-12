@@ -578,6 +578,34 @@ EOF
     systemctl restart awg-quick@awg1
     sleep 2
     ok "awg1 поднят"
+
+    # Восстановление пиров из /root/clients (awg1.conf пересоздан, а конфиги клиентов сохранились)
+    PEERS_RESTORED=0
+    shopt -s nullglob
+    for CLIENT_CONF_FILE in /root/clients/*.conf; do
+        RESTORE_NAME=$(basename "$CLIENT_CONF_FILE" .conf)
+        RESTORE_PRIV=$(awk -F' = ' '/^PrivateKey =/{print $2; exit}' "$CLIENT_CONF_FILE")
+        [[ -z "$RESTORE_PRIV" ]] && continue
+        RESTORE_PUB=$(echo "$RESTORE_PRIV" | awg pubkey 2>/dev/null || true)
+        [[ -z "$RESTORE_PUB" ]] && continue
+        grep -qF "$RESTORE_PUB" "$AWG_DIR/awg1.conf" && continue
+        RESTORE_ALLOWED=$(awk '/^Address =/{printf "%s, ", $3}' "$CLIENT_CONF_FILE" | sed 's/, $//')
+        [[ -z "$RESTORE_ALLOWED" ]] && continue
+        cat >> "$AWG_DIR/awg1.conf" <<EOF
+
+[Peer]
+# Client: $RESTORE_NAME
+PublicKey = $RESTORE_PUB
+AllowedIPs = $RESTORE_ALLOWED
+EOF
+        PEERS_RESTORED=$((PEERS_RESTORED + 1))
+        ok "Восстановлен пир клиента: $RESTORE_NAME"
+    done
+    shopt -u nullglob
+    if [[ $PEERS_RESTORED -gt 0 ]]; then
+        systemctl restart awg-quick@awg1
+        sleep 2
+    fi
 else
     # --- Режим обновления: константы и AmneziaWG уже на месте ---
     [[ ! -f "$CASCADE_ENV" ]] && write_cascade_env
