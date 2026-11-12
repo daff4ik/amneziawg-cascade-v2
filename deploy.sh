@@ -680,7 +680,8 @@ if [[ "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
                 ;;
             *)
                 PANEL_USER="admin"
-                PANEL_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+                # openssl завершается сам — нет SIGPIPE, безопасно под pipefail
+                PANEL_PASS=$(openssl rand -hex 12)
                 ;;
         esac
     fi
