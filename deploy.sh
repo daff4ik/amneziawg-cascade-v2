@@ -724,6 +724,7 @@ EOF
 enabled = true
 port = 80,443,8000
 filter = amnezia-panel
+backend = polling
 logpath = /var/log/amnezia-panel-auth.log
 maxretry = 5
 bantime = 3600
