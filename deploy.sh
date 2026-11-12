@@ -270,7 +270,8 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
 
     # --- Установка AmneziaWG на оба сервера (единый скрипт) ---
     say "Установка AmneziaWG на SERVER-A"
-    bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}"
+    # </dev/null: apt/debconf внутри не должен вычитывать ответы из stdin установщика
+    bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}" < /dev/null
     ok "AmneziaWG на SERVER-A готов"
 
     say "Установка AmneziaWG на SERVER-B ($DE_IP)"
@@ -583,7 +584,7 @@ else
     [[ "${IPV6_ENABLED:-0}" == "1" ]] && INSTALL_FLAGS+=(--ipv6)
 
     say "Обновление базовых пакетов AmneziaWG на SERVER-A"
-    bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}"
+    bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}" < /dev/null
     ok "Базовые пакеты обновлены"
 fi
 
