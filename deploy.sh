@@ -166,7 +166,7 @@ fi
 say "Проверка окружения"
 [[ $EUID -ne 0 ]] && { err "Запускать от root"; exit 1; }
 command -v apt >/dev/null || { err "Нужен Ubuntu/Debian"; exit 1; }
-command -v curl >/dev/null || { apt update -qq && apt install -y -qq curl; }
+command -v curl >/dev/null || { apt update -qq < /dev/null && apt install -y -qq curl < /dev/null; }
 command -v python3 >/dev/null || { err "Нужен python3"; exit 1; }
 
 HOST_IPS=$(hostname -I || true)
@@ -240,7 +240,7 @@ INSTALL_FLAGS=()
 # =====================================================================
 if [[ $UPDATE_MODE -eq 0 ]]; then
     say "Установка sshpass и проверка SSH до SERVER-B"
-    command -v sshpass >/dev/null || { apt update -qq && apt install -y -qq sshpass; }
+    command -v sshpass >/dev/null || { apt update -qq < /dev/null && apt install -y -qq sshpass < /dev/null; }
     export SSHPASS="$DE_PASS"
 
     run_de() {
@@ -690,7 +690,7 @@ if [[ "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
     download_url "web-panel/amnezia-panel.service" /tmp/amnezia-panel.service
     [[ -f /tmp/amnezia-panel.py && -f /tmp/amnezia-panel.service ]] || { err "Не удалось скачать файлы панели"; exit 1; }
 
-    apt install -y -qq python3-venv
+    apt install -y -qq python3-venv < /dev/null
     python3 -m venv /opt/amnezia-panel-venv
     /opt/amnezia-panel-venv/bin/pip install --quiet --upgrade pip
     /opt/amnezia-panel-venv/bin/pip install --quiet fastapi 'uvicorn[standard]' python-multipart
