@@ -381,7 +381,7 @@ EOF
     MSS6_RULE_A=""; MSS6_RULE_B=""
     if [[ $IPV6_ENABLED -eq 1 ]]; then
         A_V6_ADDR="Address = ${TUNNEL_A_IP6}/128"
-        A_V6_ALLOWED=", ${TUNNEL_B_IP6}/128"
+        A_V6_ALLOWED=", ::/0"
         A_V6_POSTUP="PostUp = ip -6 route add ${TUNNEL_B_IP6}/128 dev awg0
 PostUp = ip -6 route add default dev awg0 table 100
 PostUp = ip -6 rule add from ${CLIENT_SUBNET6}::/64 lookup 100
@@ -714,7 +714,7 @@ EOF
     if command -v fail2ban-client >/dev/null 2>&1; then
         cat > /etc/fail2ban/filter.d/amnezia-panel.conf <<'EOF'
 [Definition]
-failregex = ^.*Failed login attempt from <IP>.*$
+failregex = ^.*Failed login attempt from <HOST>.*$
 ignoreregex =
 EOF
         if ! grep -q '^\[amnezia-panel\]' /etc/fail2ban/jail.local 2>/dev/null; then
