@@ -403,6 +403,19 @@ def do_switch_server(server, password):
     if not ok or "INSTALLED_OK" not in (out or ""):
         return False, f"Установка AmneziaWG не удалась: {(err or out)[-300:]}"
 
+    if IPV6_ENABLED:
+        v6_check = ('ip link add _v6chk type amneziawg 2>/dev/null && '
+                    'ip -6 addr add fd00::1/128 dev _v6chk 2>/dev/null && '
+                    'ip link set _v6chk up 2>/dev/null && '
+                    'ip -6 route add fd00::2/128 dev _v6chk 2>/dev/null && '
+                    'ip -6 addr show dev _v6chk 2>/dev/null | grep -q "fd00::1"; '
+                    'r=$?; ip link del _v6chk 2>/dev/null; exit $r')
+        ok, _, _ = ssh_exec(ip, port, user, password, v6_check, timeout=30)
+        if not ok:
+            return False, (f"Модуль AmneziaWG на сервере {ip} не поддерживает IPv6 "
+                           f"(старая версия ядра/dkms), а в конфигурации туннеля IPv6 включён. "
+                           f"Выберите другой сервер.")
+
     ok, out, _ = ssh_exec(ip, port, user, password,
                           "ip route get 8.8.8.8 | awk '{print $5}' | head -1")
     de_iface = (out or "").strip().split("\n")[0]

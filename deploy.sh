@@ -268,9 +268,6 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     fi
     [[ $IPV6_ENABLED -eq 1 ]] && INSTALL_FLAGS+=(--ipv6) && ok "IPv6 включён"
 
-    # --- Общий файл констант для скриптов и панели ---
-    write_cascade_env
-
     # --- Установка AmneziaWG на оба сервера (единый скрипт) ---
     say "Установка AmneziaWG на SERVER-A"
     bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}"
@@ -280,6 +277,27 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     scp_de /tmp/amnezia-server-install.sh /tmp/amnezia-server-install.sh
     run_de "bash /tmp/amnezia-server-install.sh ${INSTALL_FLAGS[*]}; rm -f /tmp/amnezia-server-install.sh"
     ok "AmneziaWG на SERVER-B готов"
+
+    # --- Префлайт: реально ли работает IPv6 на awg-интерфейсе ---
+    # (на части связок «модуль amneziawg + старое ядро» v6-адрес на интерфейс
+    #  не вешается — проверяем факт, а не наличие маршрута по умолчанию)
+    if [[ $IPV6_ENABLED -eq 1 ]]; then
+        say "Проверка поддержки IPv6 модулем AmneziaWG"
+        V6_CHECK='ip link add _v6chk type amneziawg 2>/dev/null && ip -6 addr add fd00::1/128 dev _v6chk 2>/dev/null && ip link set _v6chk up 2>/dev/null && ip -6 route add fd00::2/128 dev _v6chk 2>/dev/null && ip -6 addr show dev _v6chk 2>/dev/null | grep -q "fd00::1"'
+        V6_OK=1
+        bash -c "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0
+        run_de "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0
+        if [[ $V6_OK -eq 0 ]]; then
+            warn "Модуль AmneziaWG на одном из серверов не поддерживает IPv6"
+            warn "(известная проблема dkms-модуля на старых ядрах) — продолжаю без IPv6."
+            IPV6_ENABLED=0
+        else
+            ok "IPv6 поддерживается обоими серверами"
+        fi
+    fi
+
+    # --- Общий файл констант для скриптов и панели ---
+    write_cascade_env
 
     say "Генерация параметров обфускации"
     gen_ranges() {
