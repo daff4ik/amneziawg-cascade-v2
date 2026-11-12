@@ -236,13 +236,14 @@ def check_github_updates():
 
 # ================ SSH helpers ================
 def ssh_exec(ip, port, user, password, command, timeout=60):
-    cmd = ["sshpass", "-p", password, "ssh",
+    cmd = ["sshpass", "-p", password, "ssh", "-n",
            "-o", "StrictHostKeyChecking=no",
            "-o", "UserKnownHostsFile=/dev/null",
            "-o", "ConnectTimeout=15",
            "-p", str(port), f"{user}@{ip}", command]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
         return r.returncode == 0, r.stdout, r.stderr
     except Exception as e:
         return False, "", str(e)

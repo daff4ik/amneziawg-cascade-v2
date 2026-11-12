@@ -244,7 +244,8 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     export SSHPASS="$DE_PASS"
 
     run_de() {
-        sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        # -n: stdin ssh отключён, чтобы не «съедать» ответы при запуске через pipe
+        sshpass -e ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=15 \
             -p "$DE_SSH_PORT" "$DE_SSH_USER@$DE_IP" "$@"
     }
