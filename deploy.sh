@@ -279,20 +279,25 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     ok "AmneziaWG на SERVER-B готов"
 
     # --- Префлайт: реально ли работает IPv6 на awg-интерфейсе ---
-    # (на части связок «модуль amneziawg + старое ядро» v6-адрес на интерфейс
-    #  не вешается — проверяем факт, а не наличие маршрута по умолчанию)
+    # ВАЖНО: IPv6 требует MTU >= 1280 на интерфейсе (RFC 8200). При MTU 1180
+    # ядро ломает v6-стек интерфейса (route add → RTNETLINK No such device),
+    # поэтому проверка идёт с боевым MTU, а при включённом v6 MTU поднимаем до 1280.
     if [[ $IPV6_ENABLED -eq 1 ]]; then
         say "Проверка поддержки IPv6 модулем AmneziaWG"
-        V6_CHECK='ip link add _v6chk type amneziawg 2>/dev/null && ip -6 addr add fd00::1/128 dev _v6chk 2>/dev/null && ip link set _v6chk up 2>/dev/null && ip -6 route add fd00::2/128 dev _v6chk 2>/dev/null && ip -6 addr show dev _v6chk 2>/dev/null | grep -q "fd00::1"'
+        V6_CHECK='ip link add _v6chk type amneziawg 2>/dev/null && ip -6 addr add fd00::1/128 dev _v6chk 2>/dev/null && ip link set mtu 1280 up dev _v6chk 2>/dev/null && ip -6 route add fd00::2/128 dev _v6chk 2>/dev/null && ip -6 addr show dev _v6chk 2>/dev/null | grep -q "fd00::1"'
         V6_OK=1
         bash -c "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0
         run_de "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0
         if [[ $V6_OK -eq 0 ]]; then
             warn "Модуль AmneziaWG на одном из серверов не поддерживает IPv6"
-            warn "(известная проблема dkms-модуля на старых ядрах) — продолжаю без IPv6."
+            warn "— продолжаю без IPv6 (клиенты останутся на IPv4, NAT44 на SERVER-B)."
             IPV6_ENABLED=0
         else
             ok "IPv6 поддерживается обоими серверами"
+            # Минимальный MTU для IPv6 — 1280 (RFC 8200)
+            MTU_AWG0=1280
+            MTU_AWG1=1280
+            MSS_CLAMP=1220
         fi
     fi
 
