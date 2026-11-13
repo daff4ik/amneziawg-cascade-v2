@@ -130,10 +130,22 @@ EOF
     cat > "$STATE_FILE" <<EOF
 TITLE="$TITLE"
 PORT="500,4500/udp"
+HOST="$HOST"
 CLIENT_FILE="$CLIENT_FILE"
 CLIENT_LINK="сервер $HOST, логин $USER_NAME, пароль $USER_PASS"
 EOF
     chmod 600 "$STATE_FILE"
+
+    # Файл основного пользователя в едином формате (<логин>.txt)
+    cat > "$WORK_DIR/$USER_NAME.txt" <<EOF
+Подключение IKEv2/IPsec
+=======================
+Сервер (адрес):  $HOST
+Логин:           $USER_NAME
+Пароль:          $USER_PASS
+Сертификат CA:   $WORK_DIR/ca-cert.pem
+EOF
+    chmod 600 "$WORK_DIR/$USER_NAME.txt"
 
     ok "$TITLE установлен"
     echo "Данные для подключения: $CLIENT_FILE"
@@ -146,9 +158,57 @@ do_remove() {
     ok "$TITLE удалён (пакет strongswan оставлен в системе)"
 }
 
+# === Управление клиентами (пользователи EAP) ===
+_ike_client_file() {
+    # $1 = логин, $2 = пароль; пишет $WORK_DIR/<логин>.txt
+    ( source "$STATE_FILE"
+      cat > "$WORK_DIR/$1.txt" <<EOF
+Подключение IKEv2/IPsec
+=======================
+Сервер (адрес):  $HOST
+Логин:           $1
+Пароль:          $2
+Сертификат CA:   $WORK_DIR/ca-cert.pem
+EOF
+      chmod 600 "$WORK_DIR/$1.txt" )
+}
+
+do_add_client() {
+    local cname="$1"
+    [[ -f "$STATE_FILE" ]] || { err "Сначала установите: $0 install"; exit 1; }
+    [[ "$cname" =~ ^[a-zA-Z0-9_-]+$ ]] || { err "Имя: только латиница, цифры, _ -"; exit 1; }
+    grep -q "^$cname : EAP " /etc/ipsec.secrets && { err "Клиент '$cname' уже существует"; exit 1; }
+    local pass
+    pass=$(openssl rand -hex 8)
+    echo "$cname : EAP \"$pass\"" >> /etc/ipsec.secrets
+    ipsec rereadsecrets 2>/dev/null || systemctl restart strongswan-starter
+    _ike_client_file "$cname" "$pass"
+    ok "Клиент '$cname' создан: $WORK_DIR/$cname.txt"
+}
+
+do_remove_client() {
+    local cname="$1"
+    grep -q "^$cname : EAP " /etc/ipsec.secrets 2>/dev/null || { err "Клиент '$cname' не найден"; exit 1; }
+    sed -i "/^$cname : EAP /d" /etc/ipsec.secrets
+    ipsec rereadsecrets 2>/dev/null || systemctl restart strongswan-starter
+    rm -f "$WORK_DIR/$cname.txt"
+    ok "Клиент '$cname' удалён"
+}
+
+do_clients() {
+    # Формат строки: имя<TAB>file:путь
+    grep -oP '^[a-zA-Z0-9_-]+(?= : EAP )' /etc/ipsec.secrets 2>/dev/null | while read -r cname; do
+        [[ -f "$WORK_DIR/$cname.txt" ]] && echo -e "$cname\tfile:$WORK_DIR/$cname.txt"
+    done
+    exit 0
+}
+
 case "${1:-status}" in
     install) do_install ;;
     remove)  do_remove ;;
+    add-client)    [[ -n "${2:-}" ]] || { err "Укажите имя: $0 add-client <имя>"; exit 1; }; do_add_client "$2" ;;
+    remove-client) [[ -n "${2:-}" ]] || { err "Укажите имя: $0 remove-client <имя>"; exit 1; }; do_remove_client "$2" ;;
+    clients)  do_clients ;;
     status)
         if [[ -f "$STATE_FILE" ]]; then
             source "$STATE_FILE"
@@ -159,10 +219,12 @@ case "${1:-status}" in
             echo "port=$PORT"
             echo "link=$CLIENT_LINK"
             echo "file=$CLIENT_FILE"
+            echo "clients_api=1"
+            echo "clients=$(grep -c ' : EAP ' /etc/ipsec.secrets 2>/dev/null || echo 0)"
         else
             echo "installed=0"
             echo "title=$TITLE"
         fi
         ;;
-    *) echo "Использование: $0 install|remove|status"; exit 1 ;;
+    *) echo "Использование: $0 install|remove|status|clients|add-client <имя>|remove-client <имя>"; exit 1 ;;
 esac

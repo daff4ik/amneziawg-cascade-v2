@@ -145,6 +145,7 @@ EOF
     cat > "$STATE_FILE" <<EOF
 TITLE="$TITLE"
 PORT="$PORT"
+HOST="$HOST"
 CLIENT_FILE="$CLIENT_FILE"
 CLIENT_LINK=""
 EOF
@@ -152,6 +153,76 @@ EOF
 
     ok "$TITLE установлен (порт $PORT/udp)"
     echo "Клиентский профиль: $CLIENT_FILE"
+}
+
+# === Управление клиентами (отдельный сертификат на клиента) ===
+# NB: отзыва (CRL) нет — удаление убирает только файлы профиля.
+# Для полного отзыва клиента переустановите протокол (remove/install).
+_ovpn_build() {
+    # $1 = имя клиента (CN); пишет $WORK_DIR/<имя>.ovpn
+    ( source "$STATE_FILE"
+      cat > "$WORK_DIR/$1.ovpn" <<EOF
+client
+dev tun
+proto udp
+remote $HOST $PORT
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+cipher AES-256-GCM
+auth SHA256
+remote-cert-tls server
+key-direction 1
+verb 3
+<ca>
+$(cat "$OVPN_DIR/ca.crt")
+</ca>
+<cert>
+$(cat "$OVPN_DIR/$1.crt")
+</cert>
+<key>
+$(cat "$OVPN_DIR/$1.key")
+</key>
+<tls-crypt>
+$(cat "$OVPN_DIR/ta.key")
+</tls-crypt>
+EOF
+      chmod 600 "$WORK_DIR/$1.ovpn" )
+}
+
+do_add_client() {
+    local cname="$1"
+    [[ -f "$STATE_FILE" ]] || { err "Сначала установите: $0 install"; exit 1; }
+    [[ "$cname" =~ ^[a-zA-Z0-9_-]+$ ]] || { err "Имя: только латиница, цифры, _ -"; exit 1; }
+    [[ -f "$WORK_DIR/$cname.ovpn" ]] && { err "Клиент '$cname' уже существует"; exit 1; }
+    ( cd "$OVPN_DIR"
+      openssl genrsa -out "$cname.key" 2048 2>/dev/null
+      openssl req -new -key "$cname.key" -subj "/CN=$cname" -out "$cname.csr" 2>/dev/null
+      openssl x509 -req -in "$cname.csr" -CA ca.crt -CAkey ca.key -CAcreateserial \
+          -days 3650 -sha256 -out "$cname.crt" 2>/dev/null
+      rm -f "$cname.csr"
+      chmod 600 "$cname.key" )
+    _ovpn_build "$cname"
+    ok "Клиент '$cname' создан: $WORK_DIR/$cname.ovpn"
+}
+
+do_remove_client() {
+    local cname="$1"
+    [[ -f "$WORK_DIR/$cname.ovpn" ]] || { err "Клиент '$cname' не найден"; exit 1; }
+    rm -f "$WORK_DIR/$cname.ovpn" "$OVPN_DIR/$cname.key" "$OVPN_DIR/$cname.crt"
+    ok "Клиент '$cname' удалён (профиль стёрт; для отзыва сертификата — переустановка протокола)"
+}
+
+do_clients() {
+    # Формат строки: имя<TAB>file:путь
+    local f base
+    shopt -s nullglob
+    for f in "$WORK_DIR"/*.ovpn; do
+        base=$(basename "$f" .ovpn)
+        echo -e "$base\tfile:$f"
+    done
+    shopt -u nullglob
 }
 
 do_remove() {
@@ -165,6 +236,9 @@ do_remove() {
 case "${1:-status}" in
     install) do_install ;;
     remove)  do_remove ;;
+    add-client)    [[ -n "${2:-}" ]] || { err "Укажите имя: $0 add-client <имя>"; exit 1; }; do_add_client "$2" ;;
+    remove-client) [[ -n "${2:-}" ]] || { err "Укажите имя: $0 remove-client <имя>"; exit 1; }; do_remove_client "$2" ;;
+    clients)  do_clients ;;
     status)
         if [[ -f "$STATE_FILE" ]]; then
             source "$STATE_FILE"
@@ -174,10 +248,12 @@ case "${1:-status}" in
             echo "title=$TITLE"
             echo "port=$PORT"
             echo "file=$CLIENT_FILE"
+            echo "clients_api=1"
+            echo "clients=$(ls -1 "$WORK_DIR"/*.ovpn 2>/dev/null | wc -l)"
         else
             echo "installed=0"
             echo "title=$TITLE"
         fi
         ;;
-    *) echo "Использование: $0 install|remove|status"; exit 1 ;;
+    *) echo "Использование: $0 install|remove|status|clients|add-client <имя>|remove-client <имя>"; exit 1 ;;
 esac

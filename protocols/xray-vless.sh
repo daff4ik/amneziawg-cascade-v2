@@ -19,6 +19,7 @@ STATE_FILE="$STATE_DIR/$NAME.conf"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF_DIR="/usr/local/etc/xray"
 XRAY_CONF="$XRAY_CONF_DIR/config.json"
+CLIENTS_FILE="$STATE_DIR/$NAME.clients"
 
 ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
@@ -127,6 +128,7 @@ EOF
 
     LINK="vless://$UUID@$HOST:$PORT?type=tcp&security=reality&pbk=$PUB&fp=chrome&sni=$SNI&sid=$SID&flow=xtls-rprx-vision#Amnezia-VLESS"
     mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+    echo "default $UUID" > "$CLIENTS_FILE" && chmod 600 "$CLIENTS_FILE"
     cat > "$STATE_FILE" <<EOF
 TITLE="$TITLE"
 PORT="$PORT"
@@ -148,9 +150,71 @@ EOF
 
 do_remove() {
     systemctl disable --now xray 2>/dev/null || true
-    rm -f /etc/systemd/system/xray.service "$STATE_FILE"
+    rm -f /etc/systemd/system/xray.service "$STATE_FILE" "$CLIENTS_FILE"
     systemctl daemon-reload
     ok "$TITLE удалён"
+}
+
+# === Управление клиентами (UUID в config.json) ===
+_vless_link() {
+    # $1 = uuid, $2 = имя клиента; параметры — из state-файла
+    ( source "$STATE_FILE"
+      echo "vless://$1@$HOST:$PORT?type=tcp&security=reality&pbk=$PUBLIC_KEY&fp=chrome&sni=$SNI&sid=$SHORT_ID&flow=xtls-rprx-vision#Amnezia-$2" )
+}
+
+_cfg_add_uuid() {
+    python3 - "$XRAY_CONF" "$1" <<'PY'
+import json, sys
+p, uid = sys.argv[1], sys.argv[2]
+c = json.load(open(p))
+c["inbounds"][0]["settings"]["clients"].append({"id": uid, "flow": "xtls-rprx-vision"})
+json.dump(c, open(p, "w"), indent=2)
+PY
+}
+
+_cfg_del_uuid() {
+    python3 - "$XRAY_CONF" "$1" <<'PY'
+import json, sys
+p, uid = sys.argv[1], sys.argv[2]
+c = json.load(open(p))
+cl = c["inbounds"][0]["settings"]["clients"]
+c["inbounds"][0]["settings"]["clients"] = [x for x in cl if x.get("id") != uid]
+json.dump(c, open(p, "w"), indent=2)
+PY
+}
+
+do_add_client() {
+    local cname="$1"
+    [[ -f "$STATE_FILE" ]] || { err "Сначала установите: $0 install"; exit 1; }
+    [[ "$cname" =~ ^[a-zA-Z0-9_-]+$ ]] || { err "Имя: только латиница, цифры, _ -"; exit 1; }
+    grep -q "^$cname " "$CLIENTS_FILE" 2>/dev/null && { err "Клиент '$cname' уже существует"; exit 1; }
+    local uid
+    uid=$("$XRAY_BIN" uuid)
+    _cfg_add_uuid "$uid"
+    echo "$cname $uid" >> "$CLIENTS_FILE"
+    systemctl restart xray
+    ok "Клиент '$cname' создан"
+    _vless_link "$uid" "$cname"
+}
+
+do_remove_client() {
+    local cname="$1"
+    local uid
+    uid=$(awk -v n="$cname" '$1==n {print $2}' "$CLIENTS_FILE" 2>/dev/null | head -1)
+    [[ -z "$uid" ]] && { err "Клиент '$cname' не найден"; exit 1; }
+    _cfg_del_uuid "$uid"
+    sed -i "/^$cname /d" "$CLIENTS_FILE"
+    systemctl restart xray
+    ok "Клиент '$cname' удалён"
+}
+
+do_clients() {
+    # Формат строки: имя<TAB>ссылка
+    [[ -f "$CLIENTS_FILE" ]] || exit 0
+    while read -r cname uid; do
+        [[ -z "$cname" ]] && continue
+        echo -e "$cname\t$(_vless_link "$uid" "$cname")"
+    done < "$CLIENTS_FILE"
 }
 
 do_status() {
@@ -162,6 +226,8 @@ do_status() {
         echo "title=$TITLE"
         echo "port=$PORT"
         echo "link=$CLIENT_LINK"
+        echo "clients_api=1"
+        echo "clients=$(grep -c . "$CLIENTS_FILE" 2>/dev/null || echo 0)"
     else
         echo "installed=0"
         echo "title=$TITLE"
@@ -171,6 +237,9 @@ do_status() {
 case "${1:-status}" in
     install) do_install ;;
     remove)  do_remove ;;
+    add-client)    [[ -n "${2:-}" ]] || { err "Укажите имя: $0 add-client <имя>"; exit 1; }; do_add_client "$2" ;;
+    remove-client) [[ -n "${2:-}" ]] || { err "Укажите имя: $0 remove-client <имя>"; exit 1; }; do_remove_client "$2" ;;
+    clients)  do_clients ;;
     status)  do_status ;;
-    *) echo "Использование: $0 install|remove|status"; exit 1 ;;
+    *) echo "Использование: $0 install|remove|status|clients|add-client <имя>|remove-client <имя>"; exit 1 ;;
 esac

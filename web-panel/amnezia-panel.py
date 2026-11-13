@@ -888,6 +888,16 @@ async function loadProtocols() {
           <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;">После переключения DNS клиенты должны заново импортировать конфиг / vpn:// ссылку. Блокировка рекламы применяется сразу.</div>`;
         }
         body += `<button class="btn btn-small btn-danger" onclick="protoAction('${p.name}','remove','${escapeHtml(p.title)}')">Удалить</button>`;
+        if (p.clients_api === '1') {
+          body += `<div style="margin-top:0.75rem;border-top:1px dashed var(--border);padding-top:0.75rem;">
+            <div style="font-weight:600;font-size:0.9rem;margin-bottom:0.5rem;">👥 Клиенты протокола (<span id="pc-count-${p.name}">${p.clients || 0}</span>)</div>
+            <div class="form-group" style="margin-bottom:0.5rem;">
+              <input type="text" id="pc-new-${p.name}" placeholder="Имя (латиница, цифры, - _)">
+              <button class="btn btn-small btn-primary" onclick="protoClientAdd('${p.name}')">Добавить</button>
+            </div>
+            <div id="pc-list-${p.name}" style="font-size:0.85rem;"></div>
+          </div>`;
+        }
       } else {
         body = `<div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:0.5rem;">${escapeHtml(p.error || '')}</div>`;
         if (p.dep && !p.dep_met) {
@@ -902,7 +912,64 @@ async function loadProtocols() {
           <strong>${escapeHtml(p.title || p.name)}</strong>${badge}
         </div>${body}</div>`;
     }).join('');
+    list.forEach(p => { if (p.installed && p.clients_api === '1') loadProtoClients(p.name); });
   } catch(e) { box.innerHTML = `<div class="alert err">❌ ${escapeHtml(e.message)}</div>`; }
+}
+
+async function loadProtoClients(pname) {
+  const el = document.getElementById('pc-list-' + pname);
+  if (!el) return;
+  try {
+    const r = await fetch(`${BASE_URL}/api/protocols/clients/${pname}`, {credentials:'same-origin'});
+    if (!r.ok) { el.innerHTML = ''; return; }
+    const cl = await r.json();
+    const cnt = document.getElementById('pc-count-' + pname);
+    if (cnt) cnt.textContent = cl.length;
+    el.innerHTML = cl.map(c => {
+      const safe = escapeHtml(c.name);
+      let act = '';
+      if (c.link) act = `<button class="btn btn-small" title="Копировать ссылку" onclick="navigator.clipboard.writeText('${c.link.replace(/'/g, "\\'")}').then(()=>alert('Ссылка скопирована'))">📋</button>`;
+      if (c.file) act = `<a class="btn btn-small" title="Скачать файл" href="${BASE_URL}/api/protocols/client-file/${pname}/${encodeURIComponent(c.name)}">⬇</a>`;
+      return `<div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;padding:0.3rem 0;border-bottom:1px solid var(--border);">
+        <strong>${safe}</strong>
+        <span style="display:flex;gap:0.3rem;">${act}
+        <button class="btn btn-small btn-danger" title="Удалить" onclick="protoClientDel('${pname}','${safe}')">×</button></span>
+      </div>`;
+    }).join('') || '<span style="color:var(--text-muted);">Нет клиентов</span>';
+  } catch(e) { console.error(e); }
+}
+
+async function protoClientAdd(pname) {
+  const inp = document.getElementById('pc-new-' + pname);
+  const cname = inp.value.trim();
+  if (!cname) { alert('Введите имя клиента'); return; }
+  showLoader('Создание клиента...');
+  try {
+    const r = await fetch(`${BASE_URL}/api/protocols/clients/${pname}/add`, {
+      method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name: cname})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Ошибка');
+    inp.value = '';
+    await loadProtoClients(pname);
+  } catch(e) { alert('❌ ' + e.message); }
+  finally { hideLoader(); }
+}
+
+async function protoClientDel(pname, cname) {
+  if (!confirm(`Удалить клиента ${cname}?`)) return;
+  showLoader('Удаление клиента...');
+  try {
+    const r = await fetch(`${BASE_URL}/api/protocols/clients/${pname}/del`, {
+      method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name: cname})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Ошибка');
+    await loadProtoClients(pname);
+  } catch(e) { alert('❌ ' + e.message); }
+  finally { hideLoader(); }
 }
 
 async function protoAction(name, action, title) {
@@ -1417,6 +1484,86 @@ async def api_proto_action(request: Request, action: str, name: str):
     if action == "install":
         link = _proto_status(name).get("link", "")
     return {"ok": True, "link": link}
+
+# --- Клиенты протоколов (xray-vless, wireguard, ipsec, openvpn) ---
+def _proto_clients(name):
+    ok, out, _ = srv_exec(f"/usr/local/bin/amnezia-proto-{name}.sh clients", timeout=30)
+    if not ok and not (out or "").strip():
+        return None
+    items = []
+    for line in (out or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        cname, ref = parts
+        entry = {"name": cname}
+        if ref.startswith("file:"):
+            entry["file"] = ref[5:]
+        else:
+            entry["link"] = ref
+        items.append(entry)
+    return items
+
+@app.get("/api/protocols/clients/{name}")
+async def api_proto_clients(request: Request, name: str):
+    current_user(request)
+    if name not in PROTOCOLS:
+        raise HTTPException(404, "Неизвестный протокол")
+    items = await run_in_threadpool(_proto_clients, name)
+    if items is None:
+        return JSONResponse({"error": "Протокол не поддерживает клиентов или недоступен"}, status_code=400)
+    return JSONResponse(items)
+
+@app.post("/api/protocols/clients/{name}/add")
+async def api_proto_client_add(request: Request, name: str):
+    current_user(request)
+    if name not in PROTOCOLS:
+        raise HTTPException(404, "Неизвестный протокол")
+    body = await request.json()
+    cname = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("name", "")))
+    if not cname:
+        return JSONResponse({"error": "Имя: только латиница, цифры, _ -"}, status_code=400)
+    ok, out, err = await run_in_threadpool(
+        srv_exec, f"/usr/local/bin/amnezia-proto-{name}.sh add-client {shlex.quote(cname)}", 120)
+    if not ok:
+        tail = ((err or "") + (out or "")).strip()[-300:]
+        return JSONResponse({"error": tail or "Ошибка создания клиента"}, status_code=500)
+    _notify(f"👤 <b>Новый клиент {name}</b>\nИмя: <code>{cname}</code>")
+    return {"ok": True}
+
+@app.post("/api/protocols/clients/{name}/del")
+async def api_proto_client_del(request: Request, name: str):
+    current_user(request)
+    if name not in PROTOCOLS:
+        raise HTTPException(404, "Неизвестный протокол")
+    body = await request.json()
+    cname = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("name", "")))
+    if not cname:
+        return JSONResponse({"error": "Недопустимое имя"}, status_code=400)
+    ok, out, err = await run_in_threadpool(
+        srv_exec, f"/usr/local/bin/amnezia-proto-{name}.sh remove-client {shlex.quote(cname)}", 60)
+    if not ok:
+        tail = ((err or "") + (out or "")).strip()[-300:]
+        return JSONResponse({"error": tail or "Ошибка удаления клиента"}, status_code=500)
+    _notify(f"🗑️ <b>Клиент {name} удалён</b>\nИмя: <code>{cname}</code>")
+    return {"ok": True}
+
+@app.get("/api/protocols/client-file/{name}/{cname}")
+async def api_proto_client_file(request: Request, name: str, cname: str):
+    """Скачивание файла клиента протокола (.ovpn, .conf, .txt)."""
+    current_user(request)
+    if name not in PROTOCOLS:
+        raise HTTPException(404, "Неизвестный протокол")
+    cn = re.sub(r"[^a-zA-Z0-9_-]", "", cname)
+    items = await run_in_threadpool(_proto_clients, name)
+    fpath = next((i.get("file") for i in (items or []) if i["name"] == cn), None)
+    if not fpath or ".." in fpath or not fpath.startswith("/etc/amnezia-protocols/"):
+        raise HTTPException(404, "Файл не найден")
+    content = await run_in_threadpool(srv_read, fpath)
+    if content is None:
+        raise HTTPException(404, "Файл не найден (или сервер недоступен)")
+    return Response(content=content, media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{os.path.basename(fpath)}"'})
 
 @app.get("/api/protocols/config/{name}")
 async def api_proto_config(request: Request, name: str):
