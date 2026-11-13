@@ -6,6 +6,7 @@ import os
 import re
 import hmac
 import hashlib
+import shlex
 import sqlite3
 import subprocess
 import time
@@ -13,7 +14,7 @@ import urllib.request
 import json
 import datetime
 from fastapi import FastAPI, HTTPException, Form, Request
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 import uvicorn
 
@@ -41,6 +42,7 @@ AUTH_LOG    = "/var/log/amnezia-panel-auth.log"
 # ================ Общие константы каскада (пишет deploy.sh) ================
 def load_cascade_env():
     env = {
+        "INSTALL_MODE": "3",
         "AWG_TUNNEL_PORT": "8443",
         "TUNNEL_A_IP": "10.10.10.2",
         "TUNNEL_B_IP": "10.10.10.1",
@@ -51,6 +53,9 @@ def load_cascade_env():
         "MTU_AWG0": "1180",
         "MSS_CLAMP": "1000",
         "IPV6_ENABLED": "0",
+        "SERVER_B_IP": "",
+        "SERVER_B_PORT": "22",
+        "SERVER_B_USER": "root",
     }
     if os.path.exists(CASCADE_ENV):
         try:
@@ -66,6 +71,17 @@ def load_cascade_env():
 
 CAS = load_cascade_env()
 IPV6_ENABLED = CAS["IPV6_ENABLED"] == "1"
+
+# Режим установки: 1 = только SERVER-A, 2 = только SERVER-B (управление отсюда), 3 = каскад
+INSTALL_MODE = CAS["INSTALL_MODE"]
+REMOTE_MODE = INSTALL_MODE == "2"
+SERVER_B_IP   = CAS["SERVER_B_IP"]
+SERVER_B_PORT = CAS["SERVER_B_PORT"]
+SERVER_B_USER = CAS["SERVER_B_USER"]
+SSH_KEY = "/root/.ssh/id_ed25519"
+
+MODE_LABELS = {"1": "Только SERVER-A", "2": "Только SERVER-B (управление с A)", "3": "Каскад A+B"}
+MODE_LABEL = MODE_LABELS.get(INSTALL_MODE, INSTALL_MODE)
 
 # ================ Конфигурация запуска ================
 def get_config_val(key, default):
@@ -211,7 +227,7 @@ def get_installed_commit():
 def check_github_updates():
     installed_sha = get_installed_commit()
     try:
-        req = urllib.request.Request(REPO_API_URL + "?per_page=15", headers={'User-Agent': 'Amnezia-Panel'})
+        req = urllib.request.Request(REPO_API_URL + "?sha=v3&per_page=15", headers={'User-Agent': 'Amnezia-Panel'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             commits = json.loads(resp.read().decode())
     except Exception as e:
@@ -245,6 +261,49 @@ def ssh_exec(ip, port, user, password, command, timeout=60):
         return r.returncode == 0, r.stdout, r.stderr
     except Exception as e:
         return False, "", str(e)
+
+# ================ Выполнение команд там, где живут протоколы ================
+# Режимы 1/3 — локально (этот сервер), режим 2 — на SERVER-B по SSH-ключу.
+def srv_exec(command, timeout=60):
+    if REMOTE_MODE:
+        cmd = ["ssh", "-n", "-i", SSH_KEY,
+               "-o", "BatchMode=yes",
+               "-o", "StrictHostKeyChecking=no",
+               "-o", "UserKnownHostsFile=/dev/null",
+               "-o", "ConnectTimeout=15",
+               "-p", str(SERVER_B_PORT), f"{SERVER_B_USER}@{SERVER_B_IP}", command]
+    else:
+        cmd = ["bash", "-c", command]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode == 0, r.stdout, r.stderr
+    except Exception as e:
+        return False, "", str(e)
+
+def srv_read(path):
+    ok, out, _ = srv_exec(f"cat {shlex.quote(path)}", timeout=15)
+    return out if ok else None
+
+def srv_write(path, content):
+    if REMOTE_MODE:
+        cmd = ["ssh", "-i", SSH_KEY,
+               "-o", "BatchMode=yes",
+               "-o", "StrictHostKeyChecking=no",
+               "-o", "UserKnownHostsFile=/dev/null",
+               "-p", str(SERVER_B_PORT), f"{SERVER_B_USER}@{SERVER_B_IP}",
+               f"cat > {shlex.quote(path)}"]
+        try:
+            r = subprocess.run(cmd, input=content, capture_output=True, text=True, timeout=30)
+            return r.returncode == 0
+        except Exception:
+            return False
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
 
 def do_switch_server(server, password):
     """Переключение SERVER-B через единый движок /usr/local/bin/amnezia-restore-b.sh
@@ -282,8 +341,12 @@ def do_switch_server(server, password):
 
 # ================ Traffic / clients ================
 def parse_clients():
-    if not os.path.exists(AWG_CONF): return []
-    with open(AWG_CONF, encoding="utf-8") as f: content = f.read()
+    if REMOTE_MODE:
+        content = srv_read(AWG_CONF)
+        if content is None: return []
+    else:
+        if not os.path.exists(AWG_CONF): return []
+        with open(AWG_CONF, encoding="utf-8") as f: content = f.read()
     out = []
     for block in re.split(r"\n(?=\[Peer\])", content):
         if "[Peer]" not in block: continue
@@ -294,22 +357,25 @@ def parse_clients():
             out.append({"name": nm.group(1), "pubkey": pk.group(1), "ip": ip.group(1) if ip else "?"})
     return out
 
-def get_live_status():
-    """Статус пиров по unix-timestamp последнего handshake (надёжнее текстового разбора)."""
+def get_live_dump():
+    """pubkey -> {hs, rx, tx} из 'awg show dump' (в режиме 2 — с SERVER-B)."""
     stats = {}
     try:
-        r = subprocess.run(["awg", "show", AWG_IFACE, "dump"],
-                           capture_output=True, text=True, timeout=5)
-        now = time.time()
-        for line in r.stdout.strip().split("\n")[1:]:
+        if REMOTE_MODE:
+            ok, out, _ = srv_exec(f"awg show {AWG_IFACE} dump", timeout=10)
+            if not ok: return stats
+        else:
+            r = subprocess.run(["awg", "show", AWG_IFACE, "dump"],
+                               capture_output=True, text=True, timeout=5)
+            out = r.stdout
+        for line in out.strip().split("\n")[1:]:
             parts = line.split("\t")
             if len(parts) < 7:
                 continue
-            try:
-                hs = int(parts[4])
-            except ValueError:
-                hs = 0
-            stats[parts[0]] = "ONLINE" if hs and now - hs <= 180 else "OFFLINE"
+            def _to_int(v):
+                try: return int(v)
+                except ValueError: return 0
+            stats[parts[0]] = {"hs": _to_int(parts[4]), "rx": _to_int(parts[5]), "tx": _to_int(parts[6])}
     except Exception:
         pass
     return stats
@@ -325,9 +391,12 @@ def fmt_bytes(b):
     return f"{int(b)} B"
 
 def enrich(clients):
-    live_status = get_live_status()
+    live = get_live_dump()
+    now = time.time()
     db_stats = {}
-    if os.path.exists(TRAFFIC_DB):
+    # История трафика (sqlite) хранится там же, где протоколы;
+    # в режиме 2 панель показывает live-счётчики из awg dump.
+    if not REMOTE_MODE and os.path.exists(TRAFFIC_DB):
         try:
             conn = sqlite3.connect(TRAFFIC_DB)
             cur = conn.cursor()
@@ -337,19 +406,35 @@ def enrich(clients):
             conn.close()
         except: pass
     for c in clients:
-        st = db_stats.get(c["pubkey"], {})
-        c["rx_bytes"] = st.get("total_rx", 0)
-        c["tx_bytes"] = st.get("total_tx", 0)
-        c["handshake_ts"] = st.get("last_handshake", 0)
+        if REMOTE_MODE:
+            st = live.get(c["pubkey"], {})
+            c["rx_bytes"] = st.get("rx", 0)
+            c["tx_bytes"] = st.get("tx", 0)
+            c["handshake_ts"] = st.get("hs", 0)
+        else:
+            st = db_stats.get(c["pubkey"], {})
+            c["rx_bytes"] = st.get("total_rx", 0)
+            c["tx_bytes"] = st.get("total_tx", 0)
+            c["handshake_ts"] = st.get("last_handshake", 0)
         c["rx"] = fmt_bytes(c["rx_bytes"])
         c["tx"] = fmt_bytes(c["tx_bytes"])
         c["handshake"] = fmt_handshake(c["handshake_ts"])
-        c["status"] = live_status.get(c["pubkey"], "NEVER" if not st else "OFFLINE")
+        hs = c["handshake_ts"]
+        if hs and now - hs <= 180:
+            c["status"] = "ONLINE"
+        elif hs or st:
+            c["status"] = "OFFLINE"
+        else:
+            c["status"] = "NEVER"
     return clients
 
 def total_traffic(clients):
     rx = tx = 0
-    if os.path.exists(TRAFFIC_DB):
+    if REMOTE_MODE:
+        # В режиме 2 sqlite-база на SERVER-B — суммируем live-счётчики
+        rx = sum(c.get("rx_bytes", 0) for c in clients)
+        tx = sum(c.get("tx_bytes", 0) for c in clients)
+    elif os.path.exists(TRAFFIC_DB):
         try:
             conn = sqlite3.connect(TRAFFIC_DB)
             cur = conn.cursor()
@@ -556,7 +641,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="tabs">
   <button class="tab active" onclick="switchTab('clients')">👥 Клиенты (<span id="clients-count">__COUNT__</span>)</button>
-  <button class="tab" onclick="switchTab('servers')">🌐 Серверы</button>
+  <button class="tab" onclick="switchTab('protocols')">🧩 Протоколы</button>
+  __SERVERS_TAB__
   <button class="tab" onclick="switchTab('notify')">🔔 Уведомления</button>
 </div>
 
@@ -620,6 +706,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div style="text-align: right; font-size: 0.75rem; color: var(--text-muted); margin-top: 1rem;">
         Обновлено: <span id="last-update">--:--:--</span>
       </div>
+    </div>
+  </div>
+
+  <div id="protocols-view" class="view-section">
+    <div class="card">
+      <h3 style="margin-top:0;">🧩 Дополнительные протоколы и сервисы</h3>
+      <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 1rem;">
+        Установка и удаление дополнительных протоколов на __PROTO_HOST__.
+        Ссылки для подключения можно импортировать в AmneziaVPN («Добавить профиль → вставить ключ»).
+      </p>
+      <div id="protocols-list"></div>
     </div>
   </div>
 
@@ -701,7 +798,7 @@ New-NetFirewallRule -DisplayName "Allow Ping from VPN" -Direction Inbound -Proto
     <div style="background: var(--bg); padding: 1rem; border-radius: 8px; margin-top: 1rem; border: 1px solid var(--border);">
       <p style="margin-top:0; font-size: 0.9rem; color: var(--text-muted);">Для обновления выполните в консоли сервера:</p>
       <code style="display:block; padding: 0.5rem; background: #000; color: #4ade80; border-radius: 6px; font-size: 0.85rem; overflow-x: auto;">
-        sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main/deploy.sh)" -- --update
+        sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3/deploy.sh)" -- --update
       </code>
     </div>
   </div>
@@ -753,6 +850,51 @@ function switchTab(tabId) {
   document.querySelector(`button[onclick="switchTab('${tabId}')"]`).classList.add('active');
   if (tabId === 'servers') loadServers();
   if (tabId === 'notify') loadNotify();
+  if (tabId === 'protocols') loadProtocols();
+}
+
+// ==================== Protocols ====================
+async function loadProtocols() {
+  const box = document.getElementById('protocols-list');
+  box.innerHTML = '<div style="color:var(--text-muted);">Загрузка...</div>';
+  try {
+    const r = await fetch(BASE_URL + '/api/protocols', {credentials:'same-origin'});
+    if (!r.ok) throw new Error('Ошибка сервера');
+    const list = await r.json();
+    box.innerHTML = list.map(p => {
+      const badge = p.installed
+        ? `<span class="status-badge status-online">${escapeHtml(p.state || 'работает')}</span>`
+        : `<span class="status-badge status-never">не установлен</span>`;
+      let body = '';
+      if (p.installed) {
+        body = `<div style="font-size:0.9rem;margin:0.5rem 0;">Порт: <code>${escapeHtml(p.port || '—')}</code></div>`;
+        if (p.link) {
+          body += `<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.8rem;word-break:break-all;margin-bottom:0.5rem;"><code>${escapeHtml(p.link)}</code></div>
+          <button class="btn btn-small" onclick="navigator.clipboard.writeText('${p.link.replace(/'/g, "\\'")}').then(()=>alert('Ссылка скопирована'))">📋 Копировать ссылку</button> `;
+        }
+        body += `<button class="btn btn-small btn-danger" onclick="protoAction('${p.name}','remove','${escapeHtml(p.title)}')">Удалить</button>`;
+      } else {
+        body = `<div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:0.5rem;">${escapeHtml(p.error || '')}</div>
+        <button class="btn btn-small btn-primary" onclick="protoAction('${p.name}','install','${escapeHtml(p.title)}')">Установить</button>`;
+      }
+      return `<div style="border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:0.75rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+          <strong>${escapeHtml(p.title || p.name)}</strong>${badge}
+        </div>${body}</div>`;
+    }).join('');
+  } catch(e) { box.innerHTML = `<div class="alert err">❌ ${escapeHtml(e.message)}</div>`; }
+}
+
+async function protoAction(name, action, title) {
+  if (action === 'remove' && !confirm(`Удалить ${title}?`)) return;
+  showLoader(action === 'install' ? `Установка ${title}... (может занять пару минут)` : `Удаление ${title}...`);
+  try {
+    const r = await fetch(BASE_URL + `/api/protocols/${action}/${name}`, {method:'POST', credentials:'same-origin'});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Ошибка');
+    if (action === 'install' && d.link) alert('✅ Установлено!\n\nСсылка для подключения:\n' + d.link);
+  } catch(e) { alert('❌ ' + e.message); }
+  finally { hideLoader(); loadProtocols(); }
 }
 
 // ==================== Telegram Notifications ====================
@@ -1044,10 +1186,15 @@ def render_page(clients, message="", error=""):
     msg = f'<div class="alert ok">✅ {message}</div>' if message else ""
     err = f'<div class="alert err">❌ {error}</div>' if error else ""
     trx, ttx = total_traffic(clients)
+    # Управление выходным шлюзом (вкладка «Серверы») есть только в каскаде
+    servers_tab = '<button class="tab" onclick="switchTab(\'servers\')">🌐 Серверы</button>' if INSTALL_MODE == "3" else ""
+    proto_host = "SERVER-B" if REMOTE_MODE else "этом сервере"
     return (PAGE_TEMPLATE
             .replace("__MSG__", msg)
             .replace("__ERR__", err)
-            .replace("__LABEL__", SERVER_LABEL)
+            .replace("__LABEL__", f"{SERVER_LABEL} · {MODE_LABEL}")
+            .replace("__SERVERS_TAB__", servers_tab)
+            .replace("__PROTO_HOST__", proto_host)
             .replace("__COUNT__", str(len(clients)))
             .replace("__TOTAL_RX__", trx)
             .replace("__TOTAL_TX__", ttx)
@@ -1188,14 +1335,56 @@ async def api_clients(request: Request):
     _clients_cache.update(ts=now, data=data)
     return JSONResponse(data)
 
+# --- API дополнительных протоколов (xray-vless, mtproxy, tor-site) ---
+PROTOCOLS = ["xray-vless", "mtproxy", "tor-site"]
+
+def _proto_status(name):
+    ok, out, err = srv_exec(f"/usr/local/bin/amnezia-proto-{name}.sh status", timeout=15)
+    if not ok and not (out or "").strip():
+        return {"name": name, "title": name, "installed": False,
+                "error": (err or "недоступно").strip()[:200]}
+    info = {"name": name, "installed": False}
+    for line in (out or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k.strip()] = v.strip().strip('"')
+    info["installed"] = info.get("installed") == "1"
+    return info
+
+@app.get("/api/protocols")
+async def api_protocols(request: Request):
+    current_user(request)
+    result = await run_in_threadpool(lambda: [_proto_status(p) for p in PROTOCOLS])
+    return JSONResponse(result)
+
+@app.post("/api/protocols/{action}/{name}")
+async def api_proto_action(request: Request, action: str, name: str):
+    current_user(request)
+    if name not in PROTOCOLS or action not in ("install", "remove"):
+        return JSONResponse({"error": "Неизвестная операция"}, status_code=400)
+    ok, out, err = await run_in_threadpool(
+        srv_exec, f"/usr/local/bin/amnezia-proto-{name}.sh {action}", 600)
+    if not ok:
+        tail = ((err or "") + (out or "")).strip()[-400:]
+        return JSONResponse({"error": tail or "Ошибка операции"}, status_code=500)
+    _notify(f"🧩 <b>Протокол {name}</b>\nОперация: {action} — OK")
+    link = ""
+    if action == "install":
+        link = _proto_status(name).get("link", "")
+    return {"ok": True, "link": link}
+
 # --- API Локальной Сети (LAN) ---
 @app.get("/api/lan/status")
 async def api_lan_status(request: Request):
     current_user(request)
     enabled = False
     try:
-        with open(AWG_CONF, "r", encoding="utf-8") as f:
-            enabled = "iptables -I FORWARD -i awg1 -o awg1 -j ACCEPT" in f.read()
+        if REMOTE_MODE:
+            content = srv_read(AWG_CONF) or ""
+        else:
+            with open(AWG_CONF, "r", encoding="utf-8") as f:
+                content = f.read()
+        enabled = "iptables -I FORWARD -i awg1 -o awg1 -j ACCEPT" in content
     except Exception:
         pass
     return JSONResponse({"enabled": enabled})
@@ -1203,17 +1392,14 @@ async def api_lan_status(request: Request):
 def _apply_lan_rules(enable: bool):
     """Применяет LAN-правила на лету, без перезапуска awg1 (клиенты не отключаются)."""
     subnet = f"{CAS['CLIENT_SUBNET']}.0/24"
-    rule = ["FORWARD", "-i", "awg1", "-o", "awg1", "-j", "ACCEPT"]
+    rule = "FORWARD -i awg1 -o awg1 -j ACCEPT"
     if enable:
-        if subprocess.run(["iptables", "-C"] + rule, capture_output=True).returncode != 0:
-            subprocess.run(["iptables", "-I"] + rule, capture_output=True)
-        subprocess.run(["ip", "route", "add", subnet, "dev", "awg1", "table", "100"],
-                       capture_output=True)
+        script = (f"iptables -C {rule} 2>/dev/null || iptables -I {rule}; "
+                  f"ip route add {subnet} dev awg1 table 100 2>/dev/null || true")
     else:
-        while subprocess.run(["iptables", "-D"] + rule, capture_output=True).returncode == 0:
-            pass
-        subprocess.run(["ip", "route", "del", subnet, "dev", "awg1", "table", "100"],
-                       capture_output=True)
+        script = (f"while iptables -D {rule} 2>/dev/null; do :; done; "
+                  f"ip route del {subnet} dev awg1 table 100 2>/dev/null || true")
+    srv_exec(script, timeout=20)
 
 @app.post("/api/lan/toggle")
 async def api_lan_toggle(request: Request):
@@ -1230,8 +1416,14 @@ async def api_lan_toggle(request: Request):
     ]
 
     try:
-        with open(AWG_CONF, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        if REMOTE_MODE:
+            content = srv_read(AWG_CONF)
+            if content is None:
+                return JSONResponse({"error": "SERVER-B недоступен по SSH"}, status_code=502)
+        else:
+            with open(AWG_CONF, "r", encoding="utf-8") as f:
+                content = f.read()
+        lines = content.splitlines(keepends=True)
 
         # Очищаем конфиг от этих правил на случай, если они уже есть
         clean_lines = [l for l in lines if l not in lan_rules]
@@ -1245,8 +1437,8 @@ async def api_lan_toggle(request: Request):
                     break
             clean_lines = clean_lines[:insert_idx] + lan_rules + clean_lines[insert_idx:]
 
-        with open(AWG_CONF, "w", encoding="utf-8") as f:
-            f.writelines(clean_lines)
+        if not srv_write(AWG_CONF, "".join(clean_lines)):
+            return JSONResponse({"error": "Не удалось записать конфиг"}, status_code=500)
 
         # Правила применяются напрямую — перезапуск интерфейса не нужен
         await run_in_threadpool(_apply_lan_rules, enable)
@@ -1292,9 +1484,17 @@ def _add_server_sync(body):
     save_servers(data)
     return {"ok": True, "server": server}
 
+def _cascade_only():
+    if INSTALL_MODE != "3":
+        return JSONResponse({"error": "Управление выходным шлюзом доступно только в каскадном режиме (INSTALL_MODE=3)"},
+                            status_code=400)
+    return None
+
 @app.post("/api/servers/add")
 async def api_servers_add(request: Request):
     current_user(request)
+    guard = _cascade_only()
+    if guard: return guard
     body = await request.json()
     result = await run_in_threadpool(_add_server_sync, body)
     if "error" in result: return JSONResponse(result, status_code=400)
@@ -1312,6 +1512,8 @@ async def api_servers_del(request: Request, sid: int):
 @app.post("/api/servers/switch/{sid}")
 async def api_servers_switch(request: Request, sid: int):
     current_user(request)
+    guard = _cascade_only()
+    if guard: return guard
     try: body = await request.json(); password = body.get("password", "")
     except Exception: password = ""
     if not password: return JSONResponse({"error": "Требуется SSH-пароль"}, status_code=400)
@@ -1333,58 +1535,59 @@ async def create_client(request: Request, name: str = Form(...)):
     current_user(request)
     n = re.sub(r"[^a-zA-Z0-9_-]", "", name)
     if not n: return RedirectResponse(f"{BASE_URL}/?error=Недопустимое+имя+клиента", status_code=303)
-    try:
-        subprocess.run([ADD_SCRIPT, n], input="y\n", capture_output=True, text=True, timeout=90, check=True)
-        _clients_cache["ts"] = 0.0
+    ok, out, err = await run_in_threadpool(
+        srv_exec, f"printf 'y\\n' | {ADD_SCRIPT} {shlex.quote(n)}", 120)
+    _clients_cache["ts"] = 0.0
+    if ok:
         _notify(f"👤 <b>Новый клиент</b> (через панель)\nИмя: <code>{n}</code>")
         return RedirectResponse(f"{BASE_URL}/?message=Клиент+{n}+создан", status_code=303)
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or e.stdout or "error").strip()[:200]
-        return RedirectResponse(f"{BASE_URL}/?error={err.replace(' ','+').replace(chr(10),' ')}", status_code=303)
-    except subprocess.TimeoutExpired:
-        return RedirectResponse(f"{BASE_URL}/?error=Таймаут+операции", status_code=303)
+    tail = ((err or "") + (out or "")).strip()[:200] or "error"
+    return RedirectResponse(f"{BASE_URL}/?error={tail.replace(' ','+').replace(chr(10),' ')}", status_code=303)
 
 @app.post("/delete/{name}")
 async def delete_client(request: Request, name: str):
     current_user(request)
     n = re.sub(r"[^a-zA-Z0-9_-]", "", name)
-    try:
-        subprocess.run([REMOVE_SCRIPT, n], input="y\n", capture_output=True, text=True, timeout=60, check=True)
-        _clients_cache["ts"] = 0.0
+    ok, out, err = await run_in_threadpool(
+        srv_exec, f"printf 'y\\n' | {REMOVE_SCRIPT} {shlex.quote(n)}", 90)
+    _clients_cache["ts"] = 0.0
+    if ok:
         _notify(f"🗑️ <b>Клиент удалён</b> (через панель)\nИмя: <code>{n}</code>")
         return RedirectResponse(f"{BASE_URL}/?message=Клиент+{n}+удалён", status_code=303)
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or e.stdout or "error").strip()[:200]
-        return RedirectResponse(f"{BASE_URL}/?error={err.replace(' ','+').replace(chr(10),' ')}", status_code=303)
+    tail = ((err or "") + (out or "")).strip()[:200] or "error"
+    return RedirectResponse(f"{BASE_URL}/?error={tail.replace(' ','+').replace(chr(10),' ')}", status_code=303)
 
 @app.post("/restart")
 async def restart_tunnels(request: Request):
     current_user(request)
-    res = []
-    for iface in ("awg0", "awg1"):
-        try:
-            subprocess.run(["systemctl", "restart", f"awg-quick@{iface}"], capture_output=True, timeout=30, check=True)
-            res.append(f"{iface}: OK")
-        except Exception: res.append(f"{iface}: FAIL")
-    msg = " | ".join(res)
+    # awg0 (туннель A<->B) существует только в каскаде; клиентский awg1 — там, где протоколы
+    ifaces = "awg0 awg1" if INSTALL_MODE == "3" else "awg1"
+    ok, out, err = await run_in_threadpool(
+        srv_exec, f"systemctl restart awg-quick@{ifaces.replace(' ', ' awg-quick@')}", 60)
+    msg = f"{ifaces}: {'OK' if ok else 'FAIL'}"
     _notify(f"🔄 <b>Перезапуск</b>\n{msg}")
     return RedirectResponse(f"{BASE_URL}/?message={msg.replace(' ','+')}", status_code=303)
+
+def _download_remote_or_local(path, filename):
+    if REMOTE_MODE:
+        content = srv_read(path)
+        if content is None: raise HTTPException(404, "Файл не найден (или SERVER-B недоступен)")
+        return Response(content=content, media_type="text/plain",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    if not os.path.isfile(path): raise HTTPException(404, "Файл не найден")
+    return FileResponse(path, media_type="text/plain", filename=filename)
 
 @app.get("/download/conf/{name}")
 async def dl_conf(request: Request, name: str):
     current_user(request)
     n = re.sub(r"[^a-zA-Z0-9_-]", "", name)
-    p = os.path.join(CLIENTS_DIR, f"{n}.conf")
-    if not os.path.isfile(p): raise HTTPException(404, "Конфигурация не найдена")
-    return FileResponse(p, media_type="text/plain", filename=f"{n}.conf")
+    return _download_remote_or_local(os.path.join(CLIENTS_DIR, f"{n}.conf"), f"{n}.conf")
 
 @app.get("/download/vpn/{name}")
 async def dl_vpn(request: Request, name: str):
     current_user(request)
     n = re.sub(r"[^a-zA-Z0-9_-]", "", name)
-    p = os.path.join(CLIENTS_DIR, f"{n}.vpn.txt")
-    if not os.path.isfile(p): raise HTTPException(404, "Ссылка не найдена")
-    return FileResponse(p, media_type="text/plain", filename=f"{n}.vpn.txt")
+    return _download_remote_or_local(os.path.join(CLIENTS_DIR, f"{n}.vpn.txt"), f"{n}.vpn.txt")
 
 if __name__ == "__main__":
     kwargs = { "host": BIND_HOST, "port": 8000, "log_level": "info", "access_log": False, "server_header": False }
