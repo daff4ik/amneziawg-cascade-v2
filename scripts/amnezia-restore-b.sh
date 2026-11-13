@@ -18,7 +18,7 @@ set -euo pipefail
 CASCADE_ENV="/etc/amnezia-cascade.env"
 AWG_DIR="/etc/amnezia/amneziawg"
 B_COPY="$AWG_DIR/awg0-de.conf.copy"
-REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main"
+REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
 
 ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -27,6 +27,7 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 [[ $EUID -ne 0 ]] && { err "Запускать от root (sudo $0)"; exit 1; }
 [[ -f "$CASCADE_ENV" ]] || { err "Нет $CASCADE_ENV — система не развёрнута"; exit 1; }
 source "$CASCADE_ENV"
+[[ "${INSTALL_MODE:-3}" == "3" ]] || { err "Переключение SERVER-B поддерживается только в каскадном режиме (INSTALL_MODE=3)"; exit 1; }
 [[ -f "$B_COPY" ]] || { err "Нет $B_COPY — копия конфига SERVER-B не сохранена (установка старой версии). Выполните deploy --update на SERVER-A, затем повторите."; exit 1; }
 
 # === Параметры: из окружения (вызывает панель) или интерактивно ===
