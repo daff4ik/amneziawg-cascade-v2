@@ -60,6 +60,10 @@ fi
 # =====================================================================
 # Nginx + Certbot
 # =====================================================================
+# nginx работает от www-data: путь к корню сайта должен быть проходим для всех
+chmod 755 /var/www
+chmod -R 755 "$WEB_ROOT"
+
 echo "Установка Nginx и Certbot..."
 apt update -qq < /dev/null
 apt install -y -qq nginx certbot python3-certbot-nginx < /dev/null
