@@ -80,7 +80,7 @@ SERVER_B_PORT = CAS["SERVER_B_PORT"]
 SERVER_B_USER = CAS["SERVER_B_USER"]
 SSH_KEY = "/root/.ssh/id_ed25519"
 
-MODE_LABELS = {"1": "Только SERVER-A", "2": "Только SERVER-B (управление с A)", "3": "Каскад A+B"}
+MODE_LABELS = {"0": "Конструктор (только панель)", "1": "Только SERVER-A", "2": "Только SERVER-B (управление с A)", "3": "Каскад A+B"}
 MODE_LABEL = MODE_LABELS.get(INSTALL_MODE, INSTALL_MODE)
 
 # ================ Конфигурация запуска ================
@@ -651,7 +651,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   __ERR__
 
   <div id="clients-view" class="view-section active">
-    
+    __AWG_HINT__
     <div class="card" style="display: flex; gap: 1rem; flex-wrap: wrap;">
       <div style="flex: 1; min-width: 280px;">
         <h3 style="margin-top:0;">➕ Новый клиент</h3>
@@ -889,8 +889,13 @@ async function loadProtocols() {
         }
         body += `<button class="btn btn-small btn-danger" onclick="protoAction('${p.name}','remove','${escapeHtml(p.title)}')">Удалить</button>`;
       } else {
-        body = `<div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:0.5rem;">${escapeHtml(p.error || '')}</div>
-        <button class="btn btn-small btn-primary" onclick="protoAction('${p.name}','install','${escapeHtml(p.title)}')">Установить</button>`;
+        body = `<div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:0.5rem;">${escapeHtml(p.error || '')}</div>`;
+        if (p.dep && !p.dep_met) {
+          body += `<button class="btn btn-small" disabled style="opacity:0.5;cursor:not-allowed;">Установить</button>
+          <span style="font-size:0.8rem;color:var(--text-muted);"> требуется: ${escapeHtml(p.dep)}</span>`;
+        } else {
+          body += `<button class="btn btn-small btn-primary" onclick="protoAction('${p.name}','install','${escapeHtml(p.title)}')">Установить</button>`;
+        }
       }
       return `<div style="border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:0.75rem;">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;flex-wrap:wrap;">
@@ -1206,12 +1211,18 @@ def render_page(clients, message="", error=""):
     # Управление выходным шлюзом (вкладка «Серверы») есть только в каскаде
     servers_tab = '<button class="tab" onclick="switchTab(\'servers\')">🌐 Серверы</button>' if INSTALL_MODE == "3" else ""
     proto_host = "SERVER-B" if REMOTE_MODE else "этом сервере"
+    # В режиме 0 без установленного AmneziaWG вкладка клиентов — с подсказкой
+    awg_hint = ""
+    if INSTALL_MODE == "0" and not os.path.exists(AWG_CONF):
+        awg_hint = ('<div class="alert err">AmneziaWG пока не установлен — '
+                    'установите его кнопкой во вкладке «🧩 Протоколы», затем здесь появятся клиенты.</div>')
     return (PAGE_TEMPLATE
             .replace("__MSG__", msg)
             .replace("__ERR__", err)
             .replace("__LABEL__", f"{SERVER_LABEL} · {MODE_LABEL}")
             .replace("__SERVERS_TAB__", servers_tab)
             .replace("__PROTO_HOST__", proto_host)
+            .replace("__AWG_HINT__", awg_hint)
             .replace("__COUNT__", str(len(clients)))
             .replace("__TOTAL_RX__", trx)
             .replace("__TOTAL_TX__", ttx)
@@ -1352,10 +1363,12 @@ async def api_clients(request: Request):
     _clients_cache.update(ts=now, data=data)
     return JSONResponse(data)
 
-# --- API дополнительных протоколов (xray-vless, mtproxy, tor-site и др.) ---
-PROTOCOLS = ["xray-vless", "mtproxy", "tor-site", "amnezia-dns", "openvpn", "ipsec", "wireguard"]
+# --- API протоколов (amneziawg — основной; остальные — дополнительные) ---
+PROTOCOLS = ["amneziawg", "xray-vless", "mtproxy", "tor-site", "amnezia-dns", "openvpn", "ipsec", "wireguard"]
 # Дополнительные действия протоколов помимо install/remove
 PROTO_EXTRA_ACTIONS = {"amnezia-dns": ("use-for-clients", "use-cloudflare", "adblock-on", "adblock-off")}
+# Зависимости: протокол -> какой протокол должен быть установлен
+PROTO_DEPS = {"amnezia-dns": "amneziawg", "wireguard": "amneziawg"}
 
 def _proto_status(name):
     ok, out, err = srv_exec(f"/usr/local/bin/amnezia-proto-{name}.sh status", timeout=15)
@@ -1374,6 +1387,13 @@ def _proto_status(name):
 async def api_protocols(request: Request):
     current_user(request)
     result = await run_in_threadpool(lambda: [_proto_status(p) for p in PROTOCOLS])
+    # Зависимости карточек (например, DNS и WireGuard требуют AmneziaWG)
+    by_name = {p["name"]: p for p in result}
+    for p in result:
+        dep = PROTO_DEPS.get(p["name"])
+        if dep:
+            p["dep"] = by_name.get(dep, {}).get("title", dep)
+            p["dep_met"] = bool(by_name.get(dep, {}).get("installed"))
     return JSONResponse(result)
 
 @app.post("/api/protocols/{action}/{name}")
@@ -1382,6 +1402,11 @@ async def api_proto_action(request: Request, action: str, name: str):
     allowed = ("install", "remove") + PROTO_EXTRA_ACTIONS.get(name, ())
     if name not in PROTOCOLS or action not in allowed:
         return JSONResponse({"error": "Неизвестная операция"}, status_code=400)
+    dep = PROTO_DEPS.get(name)
+    if dep and action == "install":
+        dep_st = await run_in_threadpool(_proto_status, dep)
+        if not dep_st.get("installed"):
+            return JSONResponse({"error": f"Сначала установите: {dep_st.get('title', dep)}"}, status_code=400)
     ok, out, err = await run_in_threadpool(
         srv_exec, f"/usr/local/bin/amnezia-proto-{name}.sh {action}", 600)
     if not ok:

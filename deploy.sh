@@ -205,17 +205,18 @@ else
         ok "Параметры из бэкапа: сервер '$SERVER_NAME', endpoint $ENDPOINT_HOST, IPv6 $([[ "$IPV6_ENABLED" == "1" ]] && echo вкл || echo выкл)"
     else
     echo "Режимы установки:"
+    echo "  0) Только веб-панель    — конструктор: протоколы ставятся кнопками из панели"
     echo "  1) Только SERVER-A      — протоколы и веб-панель на этом сервере"
     echo "  2) Только SERVER-B      — протоколы на втором сервере, веб-панель и управление здесь (на A)"
     echo "  3) Каскад A+B           — клиенты → SERVER-A → SERVER-B, веб-панель на A (максимальная скрытность B)"
     read -p "Ваш выбор [3]: " INSTALL_MODE
     INSTALL_MODE="${INSTALL_MODE:-3}"
-    [[ "$INSTALL_MODE" =~ ^[123]$ ]] || { err "Неверный режим: $INSTALL_MODE"; exit 1; }
+    [[ "$INSTALL_MODE" =~ ^[0123]$ ]] || { err "Неверный режим: $INSTALL_MODE"; exit 1; }
 
     read -p "IP-адрес этого сервера (SERVER-A): " RU_IP
     [[ -z "$RU_IP" ]] && { err "IP обязателен"; exit 1; }
 
-    if [[ "$INSTALL_MODE" != "1" ]]; then
+    if [[ "$INSTALL_MODE" =~ ^[23]$ ]]; then
     read -p "IP-адрес второго сервера (SERVER-B): " DE_IP
     [[ -z "$DE_IP" ]] && { err "IP обязателен"; exit 1; }
 
@@ -243,7 +244,7 @@ else
     read -p "Установить веб-панель на SERVER-A? (y/n) [y]: " INSTALL_PANEL
     INSTALL_PANEL="${INSTALL_PANEL:-y}"
 
-    if [[ "$INSTALL_MODE" == "1" ]]; then
+    if [[ "$INSTALL_MODE" =~ ^[01]$ ]]; then
         read -p "Установить Fail2Ban (защита от брутфорса)? (y/n) [y]: " INSTALL_F2B
     else
         read -p "Установить Fail2Ban на оба сервера (защита от брутфорса)? (y/n) [y]: " INSTALL_F2B
@@ -345,7 +346,7 @@ for f in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
 done
 
 # Дополнительные протоколы/сервисы (управляются из веб-панели)
-PROTOCOLS=(xray-vless mtproxy tor-site amnezia-dns openvpn ipsec wireguard)
+PROTOCOLS=(amneziawg xray-vless mtproxy tor-site amnezia-dns openvpn ipsec wireguard)
 for p in "${PROTOCOLS[@]}"; do
     download_url "protocols/$p.sh" "/tmp/proto-$p.sh"
     [[ -f "/tmp/proto-$p.sh" ]] && chmod +x "/tmp/proto-$p.sh"
@@ -360,8 +361,9 @@ INSTALL_FLAGS=()
 
 # =====================================================================
 #  Полная установка: SSH до SERVER-B, IPv6, туннели
+#  (режим 0 — конструктор: весь этот блок пропускается)
 # =====================================================================
-if [[ $UPDATE_MODE -eq 0 ]]; then
+if [[ $UPDATE_MODE -eq 0 && "$INSTALL_MODE" != "0" ]]; then
     if [[ "$INSTALL_MODE" != "1" ]]; then
     say "Установка sshpass и проверка SSH до SERVER-B"
     command -v sshpass >/dev/null || { apt update -qq < /dev/null && apt install -y -qq sshpass < /dev/null; }
@@ -825,7 +827,7 @@ EOF
         systemctl restart awg-quick@awg1
         sleep 2
     fi
-else
+elif [[ $UPDATE_MODE -eq 1 ]]; then
     # --- Режим обновления: константы и AmneziaWG уже на месте ---
     write_cascade_env
     [[ "${IPV6_ENABLED:-0}" == "1" ]] && INSTALL_FLAGS+=(--ipv6)
@@ -833,6 +835,10 @@ else
     say "Обновление базовых пакетов AmneziaWG на SERVER-A"
     bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}" < /dev/null
     ok "Базовые пакеты обновлены"
+else
+    # --- Режим 0 (конструктор): VPN-стек не ставим, только константы для панели ---
+    write_cascade_env
+    ok "Режим 0: установка AmneziaWG пропущена — протоколы ставятся кнопками из веб-панели"
 fi
 
 # =====================================================================
@@ -999,7 +1005,7 @@ EOF
 fi
 ok "cron настроен"
 
-if [[ $UPDATE_MODE -eq 0 ]]; then
+if [[ $UPDATE_MODE -eq 0 && "$INSTALL_MODE" != "0" ]]; then
     say "Создание первого клиента (admin)"
     if [[ "$INSTALL_MODE" == "2" ]]; then
         run_de "[[ -f /root/clients/admin.conf ]] || echo n | /usr/local/bin/amnezia-add-client.sh admin" \
@@ -1181,6 +1187,7 @@ SERVER-A восстановлен из бэкапа.
 EOM
 else
     MODE_DESC="Каскад A+B"
+    [[ "$INSTALL_MODE" == "0" ]] && MODE_DESC="Только веб-панель (конструктор протоколов)"
     [[ "$INSTALL_MODE" == "1" ]] && MODE_DESC="Только SERVER-A"
     [[ "$INSTALL_MODE" == "2" ]] && MODE_DESC="Только SERVER-B (панель на A)"
     cat <<EOM
@@ -1190,10 +1197,10 @@ else
   SERVER-A (этот): $RU_IP
 $( [[ "$INSTALL_MODE" != "1" ]] && echo "  SERVER-B:        $DE_IP" )
 $( [[ "$INSTALL_MODE" == "3" ]] && echo "  Туннель awg0:    порт $AWG_TUNNEL_PORT/udp" )
-  Клиенты awg1:    порт $AWG_CLIENT_PORT/udp
+$( [[ "$INSTALL_MODE" != "0" ]] && echo "  Клиенты awg1:    порт $AWG_CLIENT_PORT/udp
   Endpoint:        $ENDPOINT_HOST:$AWG_CLIENT_PORT
   Подсеть:         $CLIENT_SUBNET.0/24
-  IPv6:            $([[ $IPV6_ENABLED -eq 1 ]] && echo "включён ($CLIENT_SUBNET6::/64)" || echo "выключен")
+  IPv6:            $([[ $IPV6_ENABLED -eq 1 ]] && echo "включён ($CLIENT_SUBNET6::/64)" || echo "выключен")" )
   Fail2Ban:        $([[ "$INSTALL_F2B" =~ ^[yYдД] ]] && echo "установлен" || echo "не установлен")
 EOM
 fi
