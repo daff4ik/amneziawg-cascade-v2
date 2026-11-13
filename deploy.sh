@@ -301,6 +301,7 @@ SCRIPTS_TO_DOWNLOAD=(
     amnezia-notify-setup.sh
     amnezia-healthcheck.sh
     amnezia-traffic-collector.py
+    amnezia-vpn-link.py
     amnezia-panel-access.sh
     amnezia-server-install.sh
     amnezia-backup.sh
@@ -344,7 +345,7 @@ for f in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
 done
 
 # Дополнительные протоколы/сервисы (управляются из веб-панели)
-PROTOCOLS=(xray-vless mtproxy tor-site)
+PROTOCOLS=(xray-vless mtproxy tor-site amnezia-dns openvpn ipsec wireguard)
 for p in "${PROTOCOLS[@]}"; do
     download_url "protocols/$p.sh" "/tmp/proto-$p.sh"
     [[ -f "/tmp/proto-$p.sh" ]] && chmod +x "/tmp/proto-$p.sh"

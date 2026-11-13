@@ -872,6 +872,9 @@ async function loadProtocols() {
           body += `<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.8rem;word-break:break-all;margin-bottom:0.5rem;"><code>${escapeHtml(p.link)}</code></div>
           <button class="btn btn-small" onclick="navigator.clipboard.writeText('${p.link.replace(/'/g, "\\'")}').then(()=>alert('Ссылка скопирована'))">📋 Копировать ссылку</button> `;
         }
+        if (p.file) {
+          body += `<a class="btn btn-small btn-primary" href="${BASE_URL}/api/protocols/config/${p.name}">⬇ Клиентский файл</a> `;
+        }
         body += `<button class="btn btn-small btn-danger" onclick="protoAction('${p.name}','remove','${escapeHtml(p.title)}')">Удалить</button>`;
       } else {
         body = `<div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:0.5rem;">${escapeHtml(p.error || '')}</div>
@@ -1336,7 +1339,7 @@ async def api_clients(request: Request):
     return JSONResponse(data)
 
 # --- API дополнительных протоколов (xray-vless, mtproxy, tor-site) ---
-PROTOCOLS = ["xray-vless", "mtproxy", "tor-site"]
+PROTOCOLS = ["xray-vless", "mtproxy", "tor-site", "amnezia-dns", "openvpn", "ipsec", "wireguard"]
 
 def _proto_status(name):
     ok, out, err = srv_exec(f"/usr/local/bin/amnezia-proto-{name}.sh status", timeout=15)
@@ -1372,6 +1375,23 @@ async def api_proto_action(request: Request, action: str, name: str):
     if action == "install":
         link = _proto_status(name).get("link", "")
     return {"ok": True, "link": link}
+
+@app.get("/api/protocols/config/{name}")
+async def api_proto_config(request: Request, name: str):
+    """Скачивание клиентского файла протокола (.ovpn, .conf, данные IKEv2)."""
+    current_user(request)
+    if name not in PROTOCOLS:
+        raise HTTPException(404, "Неизвестный протокол")
+    st = await run_in_threadpool(_proto_status, name)
+    fpath = st.get("file", "")
+    if not fpath or not fpath.startswith(("/etc/amnezia-protocols/", "/root/clients/")):
+        raise HTTPException(404, "Файл не найден")
+    content = await run_in_threadpool(srv_read, fpath)
+    if content is None:
+        raise HTTPException(404, "Файл не найден (или сервер недоступен)")
+    fname = os.path.basename(fpath)
+    return Response(content=content, media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 # --- API Локальной Сети (LAN) ---
 @app.get("/api/lan/status")
