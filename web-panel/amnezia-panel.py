@@ -12,7 +12,6 @@ import time
 import urllib.request
 import json
 import datetime
-import shutil
 from fastapi import FastAPI, HTTPException, Form, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -22,7 +21,6 @@ CONFIG_FILE   = "/etc/amnezia-panel.conf"
 AWG_IFACE     = "awg1"
 AWG_CONF      = f"/etc/amnezia/amneziawg/{AWG_IFACE}.conf"
 AWG0_CONF     = "/etc/amnezia/amneziawg/awg0.conf"
-AWG0_PUBKEY   = "/etc/amnezia/amneziawg/public.key"
 CLIENTS_DIR   = "/root/clients"
 ADD_SCRIPT    = "/usr/local/bin/amnezia-add-client.sh"
 REMOVE_SCRIPT = "/usr/local/bin/amnezia-remove-client.sh"
@@ -248,252 +246,39 @@ def ssh_exec(ip, port, user, password, command, timeout=60):
     except Exception as e:
         return False, "", str(e)
 
-def ssh_upload(ip, port, user, password, local_path, remote_path, timeout=120):
-    cmd = ["sshpass", "-p", password, "scp",
-           "-o", "StrictHostKeyChecking=no",
-           "-o", "UserKnownHostsFile=/dev/null",
-           "-P", str(port), local_path, f"{user}@{ip}:{remote_path}"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, r.stdout, r.stderr
-    except Exception as e:
-        return False, "", str(e)
-
-INSTALL_SCRIPT = "/usr/local/bin/amnezia-server-install.sh"
-
-def install_awg_remote(ip, port, user, password):
-    """Базовая установка AmneziaWG на новый выходной сервер.
-    Используется общий скрипт amnezia-server-install.sh (тот же, что в deploy.sh)."""
-    flags = ["--fail2ban"]
-    if IPV6_ENABLED:
-        flags.append("--ipv6")
-
-    if os.path.exists(INSTALL_SCRIPT):
-        ok, _, err = ssh_upload(ip, port, user, password, INSTALL_SCRIPT, "/tmp/_awg_install.sh")
-        if not ok: return False, "", err
-        ok, out, err = ssh_exec(ip, port, user, password,
-                                "bash /tmp/_awg_install.sh " + " ".join(flags), timeout=300)
-        ssh_exec(ip, port, user, password, "rm -f /tmp/_awg_install.sh", timeout=10)
-        return ok, out, err
-
-    # Fallback: встроенный минимальный скрипт (если helper не установлен)
-    script = '''#!/bin/bash
-export DEBIAN_FRONTEND=noninteractive
-apt update -qq
-apt install -y -qq software-properties-common python3-launchpadlib gnupg2 \\
-    linux-headers-$(uname -r) build-essential dkms iptables qrencode sqlite3 fail2ban
-if ! command -v awg >/dev/null; then
-    add-apt-repository -y ppa:amnezia/ppa
-    apt update -qq
-    apt install -y -qq amneziawg
-fi
-modprobe amneziawg || true
-echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
-printf 'net.ipv4.ip_forward=1\\nnet.ipv6.conf.all.forwarding=1\\n' > /etc/sysctl.d/99-amneziawg.conf
-sysctl --system >/dev/null 2>&1 || true
-systemctl enable fail2ban 2>/dev/null || true
-systemctl restart fail2ban 2>/dev/null || true
-echo INSTALLED_OK
-'''
-    lp = "/tmp/_install_awg.sh"
-    with open(lp, "w") as f:
-        f.write(script)
-    try:
-        ok, _, err = ssh_upload(ip, port, user, password, lp, "/tmp/_install_awg.sh")
-        if not ok: return False, "", err
-        ok, out, err = ssh_exec(ip, port, user, password, "bash /tmp/_install_awg.sh", timeout=300)
-        ssh_exec(ip, port, user, password, "rm -f /tmp/_install_awg.sh", timeout=10)
-        return ok, out, err
-    finally:
-        try: os.remove(lp)
-        except: pass
-
-def build_de_conf(ru_conf_path, de_privkey, ru_pubkey, de_iface):
-    with open(ru_conf_path, encoding="utf-8") as f:
-        ru_conf = f.read()
-    def get(param):
-        m = re.search(rf"^{param}\s*=\s*(.+)$", ru_conf, re.MULTILINE)
-        return m.group(1).strip() if m else None
-    param_keys = ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
-                  "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime",
-                  "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout",
-                  "MaxHandshakeAttempts", "RandomTrailers", "DisableCookies"]
-    params = {}
-    for p in param_keys:
-        v = get(p)
-        if v: params[p] = v
-    params_str = "\n".join(f"{k} = {v}" for k, v in params.items())
-    mss = CAS["MSS_CLAMP"]
-    v6_addr = f"Address = {CAS['TUNNEL_B_IP6']}/128\n" if IPV6_ENABLED else ""
-    v6_postup = ""
-    v6_postdown = ""
-    v6_allowed = ""
-    if IPV6_ENABLED:
-        v6_postup = f"""PostUp = ip6tables -A FORWARD -i awg0 -j ACCEPT
-PostUp = ip6tables -A FORWARD -o awg0 -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o {de_iface} -j MASQUERADE
-PostUp = while ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null; do :; done
-PostUp = ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}
-"""
-        v6_postdown = f"""PostDown = ip6tables -D FORWARD -i awg0 -j ACCEPT
-PostDown = ip6tables -D FORWARD -o awg0 -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o {de_iface} -j MASQUERADE
-PostDown = ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null || true
-"""
-        v6_allowed = f", {CAS['TUNNEL_A_IP6']}/128"
-    return f"""[Interface]
-PrivateKey = {de_privkey}
-Address = {CAS['TUNNEL_B_IP']}/32
-{v6_addr}ListenPort = {CAS['AWG_TUNNEL_PORT']}
-MTU = {CAS['MTU_AWG0']}
-{params_str}
-PostUp = iptables -A FORWARD -i awg0 -j ACCEPT
-PostUp = iptables -A FORWARD -o awg0 -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o {de_iface} -j MASQUERADE
-PostUp = while iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null; do :; done
-PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}
-{v6_postup}PostDown = iptables -D FORWARD -i awg0 -j ACCEPT
-PostDown = iptables -D FORWARD -o awg0 -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o {de_iface} -j MASQUERADE
-PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss} 2>/dev/null || true
-{v6_postdown}
-[Peer]
-PublicKey = {ru_pubkey}
-AllowedIPs = {CAS['TUNNEL_A_IP']}/32{v6_allowed}
-"""
-
-def update_ru_peer(conf_text, de_pub, de_ip):
-    lines = conf_text.split("\n")
-    out = []
-    in_peer = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped == "[Peer]":
-            in_peer = True
-            out.append(line)
-            continue
-        if in_peer and stripped.startswith("["):
-            in_peer = False
-        if in_peer:
-            if stripped.startswith("PublicKey"):
-                out.append(f"PublicKey = {de_pub}")
-                continue
-            if stripped.startswith("Endpoint"):
-                out.append(f"Endpoint = {de_ip}:{CAS['AWG_TUNNEL_PORT']}")
-                continue
-        out.append(line)
-    return "\n".join(out)
-
 def do_switch_server(server, password):
+    """Переключение SERVER-B через единый движок /usr/local/bin/amnezia-restore-b.sh
+    (тот же скрипт доступен и из консоли). Панель лишь передаёт параметры
+    через окружение и обновляет active_id в своём списке серверов."""
     ip, port, user = server["ip"], server["port"], server["user"]
     name = server.get("name", ip)
 
-    ok, out, err = ssh_exec(ip, port, user, password, "echo SSH_OK")
-    if not ok or "SSH_OK" not in (out or ""):
-        return False, f"SSH до {ip} не работает: {err or out}"
+    script = "/usr/local/bin/amnezia-restore-b.sh"
+    if not os.path.exists(script):
+        return False, ("Не найден /usr/local/bin/amnezia-restore-b.sh — "
+                       "обновите систему: deploy.sh --update")
 
-    if IPV6_ENABLED:
-        ok, out, _ = ssh_exec(ip, port, user, password,
-                              "ip -6 route show default 2>/dev/null | grep -q '^default' && echo V6_OK")
-        if not ok or "V6_OK" not in (out or ""):
-            return False, (f"На сервере {ip} нет выхода в IPv6, а в текущей конфигурации "
-                           f"туннеля IPv6 включён. Выберите сервер с поддержкой IPv6.")
-
-    ok, out, err = install_awg_remote(ip, port, user, password)
-    if not ok or "INSTALLED_OK" not in (out or ""):
-        return False, f"Установка AmneziaWG не удалась: {(err or out)[-300:]}"
-
-    if IPV6_ENABLED:
-        v6_check = ('ip link add _v6chk type amneziawg 2>/dev/null && '
-                    'ip -6 addr add fd00::1/128 dev _v6chk 2>/dev/null && '
-                    'ip link set _v6chk up 2>/dev/null && '
-                    'ip -6 route add fd00::2/128 dev _v6chk 2>/dev/null && '
-                    'ip -6 addr show dev _v6chk 2>/dev/null | grep -q "fd00::1"; '
-                    'r=$?; ip link del _v6chk 2>/dev/null; exit $r')
-        ok, _, _ = ssh_exec(ip, port, user, password, v6_check, timeout=30)
-        if not ok:
-            return False, (f"Модуль AmneziaWG на сервере {ip} не поддерживает IPv6 "
-                           f"(старая версия ядра/dkms), а в конфигурации туннеля IPv6 включён. "
-                           f"Выберите другой сервер.")
-
-    ok, out, _ = ssh_exec(ip, port, user, password,
-                          "ip route get 8.8.8.8 | awk '{print $5}' | head -1")
-    de_iface = (out or "").strip().split("\n")[0]
-    if not de_iface:
-        return False, "Не удалось определить внешний интерфейс на новом DE"
-
-    r = subprocess.run(["awg", "genkey"], capture_output=True, text=True, check=True)
-    de_priv = r.stdout.strip()
-    r = subprocess.run(["awg", "pubkey"], input=de_priv, capture_output=True, text=True, check=True)
-    de_pub = r.stdout.strip()
-
-    with open(AWG0_PUBKEY, encoding="utf-8") as f:
-        ru_pub = f.read().strip()
-
-    de_conf = build_de_conf(AWG0_CONF, de_priv, ru_pub, de_iface)
-
-    ssh_exec(ip, port, user, password,
-             "mkdir -p /etc/amnezia/amneziawg && chmod 700 /etc/amnezia/amneziawg")
-    files = {
-        "/tmp/_de_awg0.conf":     de_conf,
-        "/tmp/_de_private.key":   de_priv + "\n",
-        "/tmp/_de_public.key":    de_pub + "\n",
-    }
+    env = dict(os.environ)
+    env.update({
+        "RESTORE_B_IP": str(ip),
+        "RESTORE_B_PORT": str(port),
+        "RESTORE_B_USER": user,
+        "RESTORE_B_F2B": "y",
+        "RESTORE_B_NO_JSON": "1",
+        "SSHPASS": password,
+    })
     try:
-        for lp, content in files.items():
-            with open(lp, "w") as f: f.write(content)
-        for lp in files:
-            rp = "/etc/amnezia/amneziawg/" + os.path.basename(lp).replace("_de_", "")
-            ok, _, err = ssh_upload(ip, port, user, password, lp, rp)
-            if not ok: return False, f"Ошибка загрузки {rp}: {err}"
-        ssh_exec(ip, port, user, password,
-                 "chmod 600 /etc/amnezia/amneziawg/awg0.conf /etc/amnezia/amneziawg/private.key && "
-                 "chmod 644 /etc/amnezia/amneziawg/public.key")
-    finally:
-        for lp in files:
-            try: os.remove(lp)
-            except: pass
+        r = subprocess.run([script], env=env, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        return False, f"Переключение на {ip} превысило таймаут (15 минут)"
+    if r.returncode != 0:
+        tail = ((r.stdout or "") + (r.stderr or ""))[-600:]
+        return False, f"Ошибка переключения на {ip}: {tail}"
 
-    ssh_exec(ip, port, user, password,
-             "systemctl daemon-reload && systemctl enable awg-quick@awg0 2>/dev/null; "
-             "systemctl restart awg-quick@awg0")
-
-    os.makedirs("/var/lib/amnezia-panel", exist_ok=True)
-    backup = "/var/lib/amnezia-panel/awg0.conf.before_switch"
-    shutil.copy(AWG0_CONF, backup)
-
-    try:
-        with open(AWG0_CONF, encoding="utf-8") as f:
-            ru_conf = f.read()
-        ru_conf_new = update_ru_peer(ru_conf, de_pub, ip)
-        with open(AWG0_CONF, "w", encoding="utf-8") as f:
-            f.write(ru_conf_new)
-        subprocess.run(["systemctl", "restart", "awg-quick@awg0"],
-                       capture_output=True, timeout=30)
-    except Exception as e:
-        shutil.copy(backup, AWG0_CONF)
-        subprocess.run(["systemctl", "restart", "awg-quick@awg0"], capture_output=True)
-        return False, f"Ошибка обновления конфига RU, откат выполнен: {e}"
-
-    for _ in range(6):
-        time.sleep(3)
-        r = subprocess.run(["ping", "-c", "2", "-W", "2", CAS["TUNNEL_B_IP"]],
-                           capture_output=True, text=True)
-        v4_ok = r.returncode == 0 and " 0% packet loss" in r.stdout
-        v6_ok = True
-        if IPV6_ENABLED:
-            r6 = subprocess.run(["ping", "-6", "-c", "2", "-W", "2", CAS["TUNNEL_B_IP6"]],
-                                capture_output=True, text=True)
-            v6_ok = r6.returncode == 0
-        if v4_ok and v6_ok:
-            data = load_servers()
-            data["active_id"] = server["id"]
-            save_servers(data)
-            return True, f"Успешно переключено на {name} ({ip}). Туннель работает."
-
-    shutil.copy(backup, AWG0_CONF)
-    subprocess.run(["systemctl", "restart", "awg-quick@awg0"], capture_output=True)
-    return False, f"Туннель с {ip} не отвечает. Откат на предыдущий конфиг выполнен."
+    data = load_servers()
+    data["active_id"] = server["id"]
+    save_servers(data)
+    return True, f"Успешно переключено на {name} ({ip}). Туннель работает."
 
 # ================ Traffic / clients ================
 def parse_clients():
