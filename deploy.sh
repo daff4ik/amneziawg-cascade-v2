@@ -342,6 +342,14 @@ for f in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
     download_url "scripts/$f" "/tmp/$f"
     [[ -f "/tmp/$f" ]] && chmod +x "/tmp/$f"
 done
+
+# Дополнительные протоколы/сервисы (управляются из веб-панели)
+PROTOCOLS=(xray-vless mtproxy tor-site)
+for p in "${PROTOCOLS[@]}"; do
+    download_url "protocols/$p.sh" "/tmp/proto-$p.sh"
+    [[ -f "/tmp/proto-$p.sh" ]] && chmod +x "/tmp/proto-$p.sh"
+done
+
 [[ -f /tmp/amnezia-server-install.sh ]] || { err "Не скачан amnezia-server-install.sh — без него установка невозможна"; exit 1; }
 ok "Скрипты скачаны"
 
@@ -860,6 +868,13 @@ if [[ "$INSTALL_MODE" == "2" && $UPDATE_MODE -eq 0 ]]; then
             rm -f "/tmp/_inst_$script"
         fi
     done
+    # Протоколы — тоже на SERVER-B
+    for p in "${PROTOCOLS[@]}"; do
+        if [[ -f "/tmp/proto-$p.sh" ]]; then
+            scp_de "/tmp/proto-$p.sh" "/usr/local/bin/amnezia-proto-$p.sh"
+            run_de "chmod +x /usr/local/bin/amnezia-proto-$p.sh"
+        fi
+    done
     # На SERVER-A — только управляющие скрипты
     for script in "${PANEL_SIDE_SCRIPTS[@]}"; do
         [[ -f "/tmp/$script" ]] && install_script_local "$script"
@@ -869,6 +884,12 @@ else
     mkdir -p /root/clients && chmod 700 /root/clients
     for script in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
         [[ -f "/tmp/$script" ]] && install_script_local "$script"
+    done
+    for p in "${PROTOCOLS[@]}"; do
+        if [[ -f "/tmp/proto-$p.sh" ]]; then
+            cp "/tmp/proto-$p.sh" "/usr/local/bin/amnezia-proto-$p.sh"
+            chmod +x "/usr/local/bin/amnezia-proto-$p.sh"
+        fi
     done
 fi
 ok "Скрипты установлены"
@@ -1095,7 +1116,7 @@ EOF
     rm -f /tmp/amnezia-panel.py /tmp/amnezia-panel.service
 
     echo "  ↓ Сохранение текущей версии репозитория"
-    LATEST_SHA=$(curl -s "https://api.github.com/repos/daff4ik/amneziawg-cascade-v2/commits/main" \
+    LATEST_SHA=$(curl -s "https://api.github.com/repos/daff4ik/amneziawg-cascade-v2/commits/v3" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
     [[ -n "$LATEST_SHA" ]] && echo "$LATEST_SHA" > /var/lib/amnezia-panel/installed_commit
 fi
