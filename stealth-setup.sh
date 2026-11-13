@@ -17,10 +17,14 @@ WEB_ROOT="/var/www/stealth"
 [[ -f "$PANEL_CONF" ]] || { echo "Ошибка: веб-панель не установлена (нет $PANEL_CONF)"; exit 1; }
 
 echo "=== Настройка Stealth-режима веб-панели ==="
-read -p "Введите ваш домен или субдомен (например, mysite.com): " DOMAIN
+# Параметры можно передать через окружение (так делает deploy.sh):
+#   STEALTH_DOMAIN, STEALTH_SECRET_PATH
+DOMAIN="${STEALTH_DOMAIN:-}"
+SECRET_PATH="${STEALTH_SECRET_PATH:-}"
+[[ -z "$DOMAIN" ]] && read -p "Введите ваш домен или субдомен (например, mysite.com): " DOMAIN
 [[ -z "$DOMAIN" ]] && { echo "Домен обязателен."; exit 1; }
 
-read -p "Введите кодовое слово для скрытого пути (латиница/цифры, без слэшей): " SECRET_PATH
+[[ -z "$SECRET_PATH" ]] && read -p "Введите кодовое слово для скрытого пути (латиница/цифры, без слэшей): " SECRET_PATH
 SECRET_PATH=$(echo "$SECRET_PATH" | tr -d '/' | sed 's/[^a-zA-Z0-9_-]//g')
 [[ -z "$SECRET_PATH" ]] && { echo "Кодовое слово обязательно."; exit 1; }
 
@@ -89,8 +93,8 @@ fi
 # Nginx + Certbot
 # =====================================================================
 echo "Установка Nginx и Certbot..."
-apt update -qq
-apt install -y -qq nginx certbot python3-certbot-nginx
+apt update -qq < /dev/null
+apt install -y -qq nginx certbot python3-certbot-nginx < /dev/null
 
 cat > /etc/nginx/sites-available/amnezia-stealth <<EOF
 server {

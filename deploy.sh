@@ -224,6 +224,24 @@ else
 
     read -p "Установить Fail2Ban на оба сервера (защита от брутфорса)? (y/n) [y]: " INSTALL_F2B
     INSTALL_F2B="${INSTALL_F2B:-y}"
+
+    # Stealth сразу при установке: если Endpoint — домен, прячем панель за него
+    SETUP_STEALTH=n
+    STEALTH_SECRET=""
+    if [[ ! "$ENDPOINT_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
+        echo ""
+        echo "Убедитесь, что A-запись домена $ENDPOINT_HOST уже указывает на $RU_IP — иначе SSL не выпустится."
+        read -p "Спрятать веб-панель за доменом $ENDPOINT_HOST сразу (stealth-режим)? (y/n) [y]: " SETUP_STEALTH
+        SETUP_STEALTH="${SETUP_STEALTH:-y}"
+        if [[ "$SETUP_STEALTH" =~ ^[yYдД] ]]; then
+            read -p "Кодовое слово для скрытого пути панели (латиница/цифры, без слэшей): " STEALTH_SECRET
+            STEALTH_SECRET=$(echo "$STEALTH_SECRET" | tr -d '/' | sed 's/[^a-zA-Z0-9_-]//g')
+            if [[ -z "$STEALTH_SECRET" ]]; then
+                warn "Кодовое слово пустое — stealth пропускаю (можно настроить позже через --update)"
+                SETUP_STEALTH=n
+            fi
+        fi
+    fi
     fi
 fi
 
@@ -895,6 +913,21 @@ EOF
 fi
 
 # =====================================================================
+#  Stealth сразу при первой установке (если Endpoint — домен и выбрано)
+# =====================================================================
+if [[ $UPDATE_MODE -eq 0 && "${SETUP_STEALTH:-n}" =~ ^[yYдД] && "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
+    say "Настройка Stealth-режима (домен $ENDPOINT_HOST)"
+    download_url "stealth-setup.sh" /tmp/stealth-setup.sh
+    if [[ -f /tmp/stealth-setup.sh ]]; then
+        STEALTH_DOMAIN="$ENDPOINT_HOST" STEALTH_SECRET_PATH="$STEALTH_SECRET" bash /tmp/stealth-setup.sh \
+            || warn "Stealth не настроился — повторите позже: deploy.sh --update"
+        rm -f /tmp/stealth-setup.sh
+    else
+        warn "Не удалось скачать stealth-setup.sh — настройте позже: deploy.sh --update"
+    fi
+fi
+
+# =====================================================================
 #  Настройка Stealth-режима (Только в режиме --update)
 # =====================================================================
 if [[ $UPDATE_MODE -eq 1 && "${SETUP_STEALTH:-n}" =~ ^[yYдД] ]]; then
@@ -977,8 +1010,8 @@ if [[ "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
     fi
     echo "=============================================="
 
-    # --- ИНСТРУКЦИЯ ПО STEALTH ТОЛЬКО ДЛЯ ПЕРВОЙ УСТАНОВКИ ---
-    if [[ $UPDATE_MODE -eq 0 ]]; then
+    # --- ИНСТРУКЦИЯ ПО STEALTH ТОЛЬКО ДЛЯ ПЕРВОЙ УСТАНОВКИ БЕЗ STEALTH ---
+    if [[ $UPDATE_MODE -eq 0 && ! -f /etc/amnezia-stealth.conf ]]; then
         echo ""
         say "Stealth-режим (Сайт-заглушка)"
         echo "Для максимальной маскировки вы можете спрятать панель за собственным сайтом-заглушкой."
