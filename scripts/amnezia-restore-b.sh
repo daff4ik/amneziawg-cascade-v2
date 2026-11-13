@@ -18,7 +18,7 @@ set -euo pipefail
 CASCADE_ENV="/etc/amnezia-cascade.env"
 AWG_DIR="/etc/amnezia/amneziawg"
 B_COPY="$AWG_DIR/awg0-de.conf.copy"
-REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
+REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v3/main"
 
 ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }

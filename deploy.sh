@@ -28,7 +28,7 @@ for arg in "$@"; do
 done
 
 # ==================== Константы ====================
-REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
+REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v3/main"
 
 # Режим установки: 1 = только SERVER-A, 2 = только SERVER-B (панель на A), 3 = каскад A+B
 INSTALL_MODE=3
@@ -308,9 +308,9 @@ SCRIPTS_TO_DOWNLOAD=(
 )
 
 MIRRORS=(
-    "https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
-    "https://ghproxy.net/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
-    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
+    "https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v3/main"
+    "https://ghproxy.net/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v3/main"
+    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v3/main"
 )
 
 # Запоминаем первое рабочее зеркало, чтобы не перебирать все для каждого файла
@@ -1116,7 +1116,7 @@ EOF
     rm -f /tmp/amnezia-panel.py /tmp/amnezia-panel.service
 
     echo "  ↓ Сохранение текущей версии репозитория"
-    LATEST_SHA=$(curl -s "https://api.github.com/repos/daff4ik/amneziawg-cascade-v2/commits/v3" \
+    LATEST_SHA=$(curl -s "https://api.github.com/repos/daff4ik/amneziawg-cascade-v3/commits/main" \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || true)
     [[ -n "$LATEST_SHA" ]] && echo "$LATEST_SHA" > /var/lib/amnezia-panel/installed_commit
 fi

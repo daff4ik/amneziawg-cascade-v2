@@ -31,7 +31,7 @@ TRAFFIC_DB    = "/var/lib/amnezia-panel/traffic.db"
 SERVERS_FILE  = "/var/lib/amnezia-panel/servers.json"
 SERVER_LABEL  = "__SERVER_LABEL__"
 COMMIT_STATE_FILE = "/var/lib/amnezia-panel/installed_commit"
-REPO_API_URL      = "https://api.github.com/repos/daff4ik/amneziawg-cascade-v2/commits"
+REPO_API_URL      = "https://api.github.com/repos/daff4ik/amneziawg-cascade-v3/commits"
 
 SESSION_COOKIE = "amnezia_session"
 SESSION_DAYS   = 7
@@ -227,7 +227,7 @@ def get_installed_commit():
 def check_github_updates():
     installed_sha = get_installed_commit()
     try:
-        req = urllib.request.Request(REPO_API_URL + "?sha=v3&per_page=15", headers={'User-Agent': 'Amnezia-Panel'})
+        req = urllib.request.Request(REPO_API_URL + "?sha=main&per_page=15", headers={'User-Agent': 'Amnezia-Panel'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             commits = json.loads(resp.read().decode())
     except Exception as e:
@@ -798,7 +798,7 @@ New-NetFirewallRule -DisplayName "Allow Ping from VPN" -Direction Inbound -Proto
     <div style="background: var(--bg); padding: 1rem; border-radius: 8px; margin-top: 1rem; border: 1px solid var(--border);">
       <p style="margin-top:0; font-size: 0.9rem; color: var(--text-muted);">Для обновления выполните в консоли сервера:</p>
       <code style="display:block; padding: 0.5rem; background: #000; color: #4ade80; border-radius: 6px; font-size: 0.85rem; overflow-x: auto;">
-        sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3/deploy.sh)" -- --update
+        sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v3/main/deploy.sh)" -- --update
       </code>
     </div>
   </div>
