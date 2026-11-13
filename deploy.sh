@@ -70,6 +70,7 @@ MTU_AWG1="$MTU_AWG1"
 MSS_CLAMP="$MSS_CLAMP"
 CLIENT_MTU="$CLIENT_MTU"
 CLIENT_DNS="$CLIENT_DNS"
+ENDPOINT_HOST="$ENDPOINT_HOST"
 IPV6_ENABLED="$IPV6_ENABLED"
 TUNNEL_A_IP6="$TUNNEL_A_IP6"
 TUNNEL_B_IP6="$TUNNEL_B_IP6"
@@ -96,6 +97,11 @@ if [[ $UPDATE_MODE -eq 1 ]]; then
 
     # Подхватываем константы существующей установки
     [[ -f "$CASCADE_ENV" ]] && source "$CASCADE_ENV"
+
+    read -p "Домен для Endpoint в клиентских конфигах [${ENDPOINT_HOST:-$RU_IP}]: " EH_INPUT
+    ENDPOINT_HOST="${EH_INPUT:-${ENDPOINT_HOST:-$RU_IP}}"
+    ENDPOINT_HOST=$(echo "$ENDPOINT_HOST" | sed 's/[^a-zA-Z0-9.-]//g')
+    [[ -z "$ENDPOINT_HOST" ]] && ENDPOINT_HOST="$RU_IP"
 
     OLD_SERVER_NAME=""
     if [[ -f /usr/local/bin/amnezia-add-client.sh ]]; then
@@ -137,6 +143,11 @@ else
     # --- Полная установка ---
     read -p "IP-адрес этого сервера (SERVER-A): " RU_IP
     [[ -z "$RU_IP" ]] && { err "IP обязателен"; exit 1; }
+
+    read -p "Домен для Endpoint в клиентских конфигах (Enter = использовать IP $RU_IP): " ENDPOINT_HOST
+    ENDPOINT_HOST="${ENDPOINT_HOST:-$RU_IP}"
+    ENDPOINT_HOST=$(echo "$ENDPOINT_HOST" | sed 's/[^a-zA-Z0-9.-]//g')
+    [[ -z "$ENDPOINT_HOST" ]] && ENDPOINT_HOST="$RU_IP"
 
     read -p "IP-адрес второго сервера (SERVER-B): " DE_IP
     [[ -z "$DE_IP" ]] && { err "IP обязателен"; exit 1; }
@@ -608,7 +619,7 @@ EOF
     fi
 else
     # --- Режим обновления: константы и AmneziaWG уже на месте ---
-    [[ ! -f "$CASCADE_ENV" ]] && write_cascade_env
+    write_cascade_env
     [[ "${IPV6_ENABLED:-0}" == "1" ]] && INSTALL_FLAGS+=(--ipv6)
 
     say "Обновление базовых пакетов AmneziaWG на SERVER-A"
@@ -625,7 +636,7 @@ mkdir -p /usr/local/bin
 
 for script in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
     if [[ -f "/tmp/$script" ]]; then
-        sed -e "s|__SERVER_ENDPOINT__|$(sed_escape "$RU_IP:$AWG_CLIENT_PORT")|g" \
+        sed -e "s|__SERVER_ENDPOINT__|$(sed_escape "$ENDPOINT_HOST:$AWG_CLIENT_PORT")|g" \
             -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
             -e "s|__CLIENT_MTU__|$CLIENT_MTU|g" \
             -e "s|__DNS_SERVERS__|$(sed_escape "$CLIENT_DNS")|g" \
@@ -816,6 +827,7 @@ else
   SERVER-B:        $DE_IP
   Туннель awg0:    порт $AWG_TUNNEL_PORT/udp
   Клиенты awg1:    порт $AWG_CLIENT_PORT/udp
+  Endpoint:        $ENDPOINT_HOST:$AWG_CLIENT_PORT
   Подсеть:         $CLIENT_SUBNET.0/24
   IPv6:            $([[ $IPV6_ENABLED -eq 1 ]] && echo "включён ($CLIENT_SUBNET6::/64)" || echo "выключен")
   Fail2Ban:        $([[ "$INSTALL_F2B" =~ ^[yYдД] ]] && echo "на обоих серверах" || echo "не установлен")
