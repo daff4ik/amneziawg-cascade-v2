@@ -86,6 +86,33 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-c
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main/deploy.sh)" -- --update
 ```
 
+## 💾 Бэкап и восстановление (защита от блокировки IP)
+
+Вся конфигурация системы (ключи туннеля и клиентов, конфиги `awg0`/`awg1`, клиенты из `/root/clients`, настройки панели и stealth) автоматически бэкапится:
+
+* **Куда:** локально в `/root/amnezia-backups` на SERVER-A **и копия на SERVER-B** (по SSH-ключу, без пароля — ключ настраивается при установке).
+* **Когда:** ежедневно по cron + первый бэкап сразу после установки. Хранятся последние 7 копий с каждой стороны.
+* **Вручную:** `sudo amnezia-backup.sh`
+
+### Если заблокировали SERVER-A (по IP)
+
+1. Берёте новый сервер, запускаете на нём:
+   ```bash
+   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main/deploy.sh)" -- --restore
+   ```
+2. Указываете доступ к живому SERVER-B — скрипт заберёт оттуда последний бэкап и поднимет всё сам: ключи, туннель, клиентов, панель (логин/пароль панели прежние).
+3. **Конфиги клиентов менять не нужно** — ключи восстановлены. Если в Endpoint клиентов домен (рекомендуется) — просто обновите его A-запись на новый IP.
+
+### Если заблокировали SERVER-B (по IP)
+
+На SERVER-A выполните:
+
+```bash
+sudo amnezia-restore-b.sh
+```
+
+Скрипт спросит доступ к новому серверу и сделает всё сам: базовая установка, новые ключи `awg0` на B, обновление пира на A, SSH-ключ для бэкапов, переключение сервера в веб-панели. Клиенты продолжают работать без изменений.
+
 ## ⚙️ Управление через CLI (Консоль)
 
 Все функции веб-панели доступны системным администраторам напрямую из консоли сервера:
@@ -95,6 +122,8 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/daff4ik/amneziawg-c
 * **Список клиентов и статистика:** `sudo amnezia-list-clients.sh`
 * **Ручной Healthcheck туннеля:** `sudo amnezia-healthcheck.sh`
 * **Настройка уведомлений Telegram:** `sudo amnezia-notify-setup.sh` *(или прямо из веб-панели — вкладка «🔔 Уведомления»)*
+* **Бэкап вручную:** `sudo amnezia-backup.sh`
+* **Восстановление SERVER-B на новом сервере:** `sudo amnezia-restore-b.sh`
 
 ## 🗺 Roadmap: архитектура «A — чистый транзит»
 

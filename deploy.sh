@@ -6,18 +6,22 @@
 #  Использование:
 #    ./deploy.sh              # полная установка
 #    ./deploy.sh --update     # обновить скрипты/панель без трогания конфигов и SERVER-B
+#    ./deploy.sh --restore    # восстановить SERVER-A из бэкапа, лежащего на SERVER-B
 # =====================================================================
 set -euo pipefail
 
 # ==================== Парсинг аргументов ====================
 UPDATE_MODE=0
+RESTORE_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --update) UPDATE_MODE=1 ;;
+        --restore) RESTORE_MODE=1 ;;
         --help|-h)
             echo "Использование:"
             echo "  $0              # полная установка"
             echo "  $0 --update     # обновить скрипты и панель (только SERVER-A)"
+            echo "  $0 --restore    # восстановить SERVER-A из бэкапа на SERVER-B"
             exit 0
             ;;
     esac
@@ -71,6 +75,11 @@ MSS_CLAMP="$MSS_CLAMP"
 CLIENT_MTU="$CLIENT_MTU"
 CLIENT_DNS="$CLIENT_DNS"
 ENDPOINT_HOST="$ENDPOINT_HOST"
+SERVER_NAME="$SERVER_NAME"
+SERVER_B_IP="${SERVER_B_IP:-${DE_IP:-}}"
+SERVER_B_PORT="${SERVER_B_PORT:-${DE_SSH_PORT:-22}}"
+SERVER_B_USER="${SERVER_B_USER:-${DE_SSH_USER:-root}}"
+SERVER_B_IFACE="${SERVER_B_IFACE:-${DE_IFACE:-}}"
 IPV6_ENABLED="$IPV6_ENABLED"
 TUNNEL_A_IP6="$TUNNEL_A_IP6"
 TUNNEL_B_IP6="$TUNNEL_B_IP6"
@@ -141,6 +150,52 @@ if [[ $UPDATE_MODE -eq 1 ]]; then
     ok "Параметры для обновления получены"
 else
     # --- Полная установка ---
+    if [[ $RESTORE_MODE -eq 1 ]]; then
+        say "Режим восстановления SERVER-A из бэкапа на SERVER-B"
+        read -p "IP-адрес SERVER-B (там лежит бэкап): " DE_IP
+        [[ -z "$DE_IP" ]] && { err "IP обязателен"; exit 1; }
+
+        read -p "SSH-порт SERVER-B [22]: " DE_SSH_PORT
+        DE_SSH_PORT="${DE_SSH_PORT:-22}"
+
+        read -p "SSH-пользователь SERVER-B [root]: " DE_SSH_USER
+        DE_SSH_USER="${DE_SSH_USER:-root}"
+
+        read -r -s -p "SSH-пароль SERVER-B: " DE_PASS; echo
+        [[ -z "$DE_PASS" ]] && { err "Пароль обязателен"; exit 1; }
+
+        command -v sshpass >/dev/null || { apt update -qq < /dev/null && apt install -y -qq sshpass < /dev/null; }
+        export SSHPASS="$DE_PASS"
+
+        say "Скачивание последнего бэкапа с SERVER-B"
+        BK_FILE=$(sshpass -e ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=15 -p "$DE_SSH_PORT" "$DE_SSH_USER@$DE_IP" \
+            "ls -1t /root/amnezia-backups/amnezia-backup-*.tar.gz 2>/dev/null | head -1" | tr -d '\r')
+        [[ -z "$BK_FILE" ]] && { err "На SERVER-B нет бэкапов (/root/amnezia-backups/)"; exit 1; }
+        sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -P "$DE_SSH_PORT" "$DE_SSH_USER@$DE_IP:$BK_FILE" /tmp/amnezia-restore.tar.gz
+        tar -xzf /tmp/amnezia-restore.tar.gz -C /
+        rm -f /tmp/amnezia-restore.tar.gz
+        ok "Бэкап распакован: $BK_FILE"
+
+        [[ -f "$CASCADE_ENV" ]] || { err "В бэкапе нет $CASCADE_ENV"; exit 1; }
+        source "$CASCADE_ENV"
+
+        RU_IP=$(hostname -I | awk '{print $1}')
+        read -p "IP-адрес этого сервера (новый SERVER-A) [$RU_IP]: " RU_IP_INPUT
+        RU_IP="${RU_IP_INPUT:-$RU_IP}"
+        [[ -z "$RU_IP" ]] && { err "Не удалось определить IP этого сервера"; exit 1; }
+
+        # Если Endpoint был IP старого сервера A — переключаем на новый IP; домен не трогаем
+        if [[ "$ENDPOINT_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ENDPOINT_HOST="$RU_IP"
+        fi
+
+        INSTALL_PANEL=n
+        [[ -f /etc/amnezia-panel.conf ]] && INSTALL_PANEL=y
+        INSTALL_F2B=y
+        ok "Параметры из бэкапа: сервер '$SERVER_NAME', endpoint $ENDPOINT_HOST, IPv6 $([[ "$IPV6_ENABLED" == "1" ]] && echo вкл || echo выкл)"
+    else
     read -p "IP-адрес этого сервера (SERVER-A): " RU_IP
     [[ -z "$RU_IP" ]] && { err "IP обязателен"; exit 1; }
 
@@ -169,6 +224,7 @@ else
 
     read -p "Установить Fail2Ban на оба сервера (защита от брутфорса)? (y/n) [y]: " INSTALL_F2B
     INSTALL_F2B="${INSTALL_F2B:-y}"
+    fi
 fi
 
 # =====================================================================
@@ -202,6 +258,8 @@ SCRIPTS_TO_DOWNLOAD=(
     amnezia-traffic-collector.py
     amnezia-panel-access.sh
     amnezia-server-install.sh
+    amnezia-backup.sh
+    amnezia-restore-b.sh
 )
 
 MIRRORS=(
@@ -269,6 +327,11 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     ok "SSH работает"
 
     # --- Определение доступности IPv6 на SERVER-B ---
+    if [[ $RESTORE_MODE -eq 1 ]]; then
+        # Восстановление: параметры берём из бэкапа, SERVER-B не трогаем
+        [[ "$IPV6_ENABLED" == "1" ]] && IPV6_ENABLED=1 || IPV6_ENABLED=0
+        [[ $IPV6_ENABLED -eq 1 ]] && INSTALL_FLAGS+=(--ipv6)
+    else
     say "Проверка IPv6 на SERVER-B"
     if run_de "ip -6 route show default 2>/dev/null | grep -q '^default'"; then
         read -p "На SERVER-B есть выход в IPv6. Включить IPv6 в туннеле? (y/n) [y]: " V6_ANS
@@ -278,6 +341,7 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
         echo "IPv6 на SERVER-B не обнаружен — туннель будет только IPv4."
     fi
     [[ $IPV6_ENABLED -eq 1 ]] && INSTALL_FLAGS+=(--ipv6) && ok "IPv6 включён"
+    fi
 
     # --- Установка AmneziaWG на оба сервера (единый скрипт) ---
     say "Установка AmneziaWG на SERVER-A"
@@ -285,16 +349,18 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}" < /dev/null
     ok "AmneziaWG на SERVER-A готов"
 
+    if [[ $RESTORE_MODE -eq 0 ]]; then
     say "Установка AmneziaWG на SERVER-B ($DE_IP)"
     scp_de /tmp/amnezia-server-install.sh /tmp/amnezia-server-install.sh
     run_de "bash /tmp/amnezia-server-install.sh ${INSTALL_FLAGS[*]}; rm -f /tmp/amnezia-server-install.sh"
     ok "AmneziaWG на SERVER-B готов"
+    fi
 
     # --- Префлайт: реально ли работает IPv6 на awg-интерфейсе ---
     # ВАЖНО: IPv6 требует MTU >= 1280 на интерфейсе (RFC 8200). При MTU 1180
     # ядро ломает v6-стек интерфейса (route add → RTNETLINK No such device),
     # поэтому проверка идёт с боевым MTU, а при включённом v6 MTU поднимаем до 1280.
-    if [[ $IPV6_ENABLED -eq 1 ]]; then
+    if [[ $IPV6_ENABLED -eq 1 && $RESTORE_MODE -eq 0 ]]; then
         say "Проверка поддержки IPv6 модулем AmneziaWG"
         V6_CHECK='ip link add _v6chk type amneziawg 2>/dev/null && ip -6 addr add fd00::1/128 dev _v6chk 2>/dev/null && ip link set mtu 1280 up dev _v6chk 2>/dev/null && ip -6 route add fd00::2/128 dev _v6chk 2>/dev/null && ip -6 addr show dev _v6chk 2>/dev/null | grep -q "fd00::1"'
         V6_OK=1
@@ -317,6 +383,9 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     write_cascade_env
 
     say "Генерация параметров обфускации"
+    if [[ $RESTORE_MODE -eq 1 ]]; then
+        ok "Пропускаю: конфиги и ключи восстановлены из бэкапа"
+    else
     gen_ranges() {
         python3 - <<'PY'
 import random
@@ -523,12 +592,19 @@ EOF
 
     scp_de /tmp/awg0-de.conf "$AWG_DIR/awg0.conf"
     run_de "chmod 600 $AWG_DIR/awg0.conf"
+    # Копия конфига SERVER-B для amnezia-restore-b.sh и бэкапа
+    cp /tmp/awg0-de.conf "$AWG_DIR/awg0-de.conf.copy"
+    chmod 600 "$AWG_DIR/awg0-de.conf.copy"
     rm -f /tmp/awg0-de.conf
     ok "Конфиги awg0 записаны"
+    write_cascade_env   # теперь известен и DE_IFACE — сохраняем полный набор
+    fi
 
     say "Запуск межсерверного туннеля"
-    run_de "systemctl enable awg-quick@awg0 && systemctl restart awg-quick@awg0"
-    sleep 2
+    if [[ $RESTORE_MODE -eq 0 ]]; then
+        run_de "systemctl enable awg-quick@awg0 && systemctl restart awg-quick@awg0"
+        sleep 2
+    fi
     systemctl enable awg-quick@awg0
     systemctl restart awg-quick@awg0
     sleep 3
@@ -546,6 +622,9 @@ EOF
     fi
 
     say "Настройка клиентского интерфейса awg1"
+    if [[ $RESTORE_MODE -eq 1 ]]; then
+        ok "awg1.conf восстановлен из бэкапа — генерация не требуется"
+    else
     if [[ ! -f "$AWG_DIR/awg1_private.key" ]]; then
         umask 077
         awg genkey > "$AWG_DIR/awg1_private.key"
@@ -584,6 +663,7 @@ RandomTrailers = on
 DisableCookies = on
 EOF
     chmod 600 "$AWG_DIR/awg1.conf"
+    fi
 
     systemctl enable awg-quick@awg1
     systemctl restart awg-quick@awg1
@@ -676,6 +756,24 @@ EOF
     chmod 644 /etc/cron.d/amnezia-traffic
     /usr/local/bin/amnezia-traffic-collector.py 2>/dev/null || true
 fi
+
+# === Ежедневный бэкап (локально + копия на SERVER-B по SSH-ключу) ===
+if [[ -x /usr/local/bin/amnezia-backup.sh ]]; then
+    cat > /etc/cron.d/amnezia-backup <<'EOF'
+17 4 * * * root /usr/local/bin/amnezia-backup.sh
+EOF
+    chmod 644 /etc/cron.d/amnezia-backup
+
+    # SSH-ключ SERVER-A -> SERVER-B для отправки бэкапов (fresh и restore)
+    if [[ $UPDATE_MODE -eq 0 ]]; then
+        say "Настройка SSH-ключа для бэкапов на SERVER-B"
+        [[ ! -f /root/.ssh/id_ed25519 ]] && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 -q
+        A_PUBKEY=$(cat /root/.ssh/id_ed25519.pub)
+        run_de "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && grep -qxF '$A_PUBKEY' /root/.ssh/authorized_keys || echo '$A_PUBKEY' >> /root/.ssh/authorized_keys" \
+            && ok "SSH-ключ установлен на SERVER-B" \
+            || warn "Не удалось установить SSH-ключ на SERVER-B — бэкап будет только локальным"
+    fi
+fi
 ok "cron настроен"
 
 if [[ $UPDATE_MODE -eq 0 ]]; then
@@ -693,7 +791,7 @@ fi
 if [[ "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
     say "Установка веб-панели"
 
-    if [[ $UPDATE_MODE -eq 1 && -f /etc/amnezia-panel.conf ]]; then
+    if [[ ( $UPDATE_MODE -eq 1 || $RESTORE_MODE -eq 1 ) && -f /etc/amnezia-panel.conf ]]; then
         AUTH_CHOICE="keep"
         ok "Учётные данные панели сохраняются"
     else
@@ -814,10 +912,27 @@ fi
 # =====================================================================
 #  Итоговый вывод
 # =====================================================================
+# === Первый бэкап — после полной настройки (включая панель) ===
+if [[ $UPDATE_MODE -eq 0 && -x /usr/local/bin/amnezia-backup.sh ]]; then
+    say "Создание первого бэкапа"
+    /usr/local/bin/amnezia-backup.sh || warn "Первый бэкап не удался — проверьте вручную: /usr/local/bin/amnezia-backup.sh"
+fi
+
 say "ГОТОВО"
 if [[ $UPDATE_MODE -eq 1 ]]; then
     echo "Режим обновления завершён."
     echo "Конфиги awg0/awg1 и клиенты не изменены."
+elif [[ $RESTORE_MODE -eq 1 ]]; then
+    cat <<EOM
+
+SERVER-A восстановлен из бэкапа.
+
+  Новый SERVER-A:  $RU_IP
+  SERVER-B:        $DE_IP (конфиг не менялся)
+  Endpoint:        $ENDPOINT_HOST:$AWG_CLIENT_PORT
+  Клиенты и ключи восстановлены — конфиги клиентов менять НЕ нужно.
+  Если Endpoint — домен, обновите его A-запись на $RU_IP.
+EOM
 else
     cat <<EOM
 
