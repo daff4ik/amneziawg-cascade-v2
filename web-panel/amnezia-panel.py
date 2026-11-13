@@ -811,6 +811,7 @@ New-NetFirewallRule -DisplayName "Allow Ping from VPN" -Direction Inbound -Proto
 
 <script>
 const BASE_URL = "__BASE__";
+const INSTALL_MODE = "__MODE__";
 let _allClients = [];
 let _serversData = { active_id: null, servers: [] };
 let _currentSort = 'name';
@@ -886,6 +887,17 @@ async function loadProtocols() {
             <button class="btn btn-small ${abOn ? '' : 'btn-primary'}" onclick="protoAction('amnezia-dns','${abOn ? 'adblock-off' : 'adblock-on'}','блокировка рекламы')">${abLabel}</button>
           </div>
           <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;">После переключения DNS клиенты должны заново импортировать конфиг / vpn:// ссылку. Блокировка рекламы применяется сразу.</div>`;
+        }
+        if (p.name === 'amneziawg' && INSTALL_MODE !== '3') {
+          body += `<button class="btn btn-small btn-primary" onclick="protoCascade('amneziawg')">🔗 Сделать каскад (A → B)</button> `;
+        }
+        if (p.name === 'xray-vless') {
+          if (p.cascade) {
+            body += `<div style="font-size:0.8rem;color:var(--text-muted);margin:0.3rem 0;">🔗 Каскад через SERVER-B: ${escapeHtml(p.cascade)}</div>
+            <button class="btn btn-small" onclick="protoAction('xray-vless','direct','отключение каскада (прямое подключение)')">↩️ Прямое подключение</button> `;
+          } else {
+            body += `<button class="btn btn-small btn-primary" onclick="protoCascade('xray-vless')">🔗 Сделать каскад (A → B)</button> `;
+          }
         }
         body += `<button class="btn btn-small btn-danger" onclick="protoAction('${p.name}','remove','${escapeHtml(p.title)}')">Удалить</button>`;
         if (p.clients_api === '1') {
@@ -970,6 +982,27 @@ async function protoClientDel(pname, cname) {
     await loadProtoClients(pname);
   } catch(e) { alert('❌ ' + e.message); }
   finally { hideLoader(); }
+}
+
+async function protoCascade(pname) {
+  const ip = prompt('IP-адрес SERVER-B (выходной сервер):');
+  if (!ip) return;
+  const port = prompt('SSH-порт SERVER-B:', '22') || '22';
+  const user = prompt('SSH-пользователь SERVER-B:', 'root') || 'root';
+  const password = prompt('SSH-пароль SERVER-B (не сохраняется, используется один раз):');
+  if (!password) { alert('Без пароля настройка невозможна'); return; }
+  showLoader('Настройка каскада A → B... (может занять несколько минут)');
+  try {
+    const r = await fetch(`${BASE_URL}/api/protocols/cascade/${pname}`, {
+      method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ip, port: parseInt(port, 10), user, password})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Ошибка');
+    alert('✅ ' + (d.message || 'Каскад настроен'));
+    if (pname === 'amneziawg') setTimeout(() => location.reload(), 1500);
+  } catch(e) { alert('❌ ' + e.message); }
+  finally { hideLoader(); loadProtocols(); }
 }
 
 async function protoAction(name, action, title) {
@@ -1290,6 +1323,7 @@ def render_page(clients, message="", error=""):
             .replace("__SERVERS_TAB__", servers_tab)
             .replace("__PROTO_HOST__", proto_host)
             .replace("__AWG_HINT__", awg_hint)
+            .replace("__MODE__", INSTALL_MODE)
             .replace("__COUNT__", str(len(clients)))
             .replace("__TOTAL_RX__", trx)
             .replace("__TOTAL_TX__", ttx)
@@ -1433,7 +1467,10 @@ async def api_clients(request: Request):
 # --- API протоколов (amneziawg — основной; остальные — дополнительные) ---
 PROTOCOLS = ["amneziawg", "xray-vless", "mtproxy", "tor-site", "amnezia-dns", "openvpn", "ipsec", "wireguard"]
 # Дополнительные действия протоколов помимо install/remove
-PROTO_EXTRA_ACTIONS = {"amnezia-dns": ("use-for-clients", "use-cloudflare", "adblock-on", "adblock-off")}
+PROTO_EXTRA_ACTIONS = {"amnezia-dns": ("use-for-clients", "use-cloudflare", "adblock-on", "adblock-off"),
+                       "xray-vless": ("direct",)}
+# Протоколы, для которых доступна настройка каскада A→B из панели
+PROTO_CASCADE = ("amneziawg", "xray-vless")
 # Зависимости: протокол -> какой протокол должен быть установлен
 PROTO_DEPS = {"amnezia-dns": "amneziawg", "wireguard": "amneziawg"}
 
@@ -1564,6 +1601,53 @@ async def api_proto_client_file(request: Request, name: str, cname: str):
         raise HTTPException(404, "Файл не найден (или сервер недоступен)")
     return Response(content=content, media_type="application/octet-stream",
                     headers={"Content-Disposition": f'attachment; filename="{os.path.basename(fpath)}"'})
+
+def _run_cascade(name, ip, port, user, password):
+    """Настройка каскада A→B. Пароль живёт только в env процесса, не сохраняется."""
+    env = dict(os.environ)
+    env["SSHPASS"] = password
+    if name == "amneziawg":
+        env.update({"CASCADE_B_IP": ip, "CASCADE_B_PORT": str(port), "CASCADE_B_USER": user})
+        cmd = ["/usr/local/bin/amnezia-cascade-setup.sh"]
+    else:
+        cmd = ["/usr/local/bin/amnezia-proto-xray-vless.sh", "cascade", ip, str(port), user]
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return False, "Операция превысила таймаут (15 минут)"
+    except Exception as e:
+        return False, str(e)
+    if r.returncode != 0:
+        return False, ((r.stdout or "") + (r.stderr or "")).strip()[-500:]
+    return True, "Каскад настроен и работает"
+
+@app.post("/api/protocols/cascade/{name}")
+async def api_proto_cascade(request: Request, name: str):
+    current_user(request)
+    if name not in PROTO_CASCADE:
+        return JSONResponse({"error": "Каскад для этого протокола не поддерживается"}, status_code=400)
+    if REMOTE_MODE:
+        return JSONResponse({"error": "В режиме 2 каскад настраивается с сервера протоколов"}, status_code=400)
+    if name == "amneziawg" and INSTALL_MODE == "3":
+        return JSONResponse({"error": "Каскад AmneziaWG уже настроен"}, status_code=400)
+    body = await request.json()
+    ip = str(body.get("ip", "")).strip()
+    port = int(body.get("port", 22))
+    user = re.sub(r"[^a-zA-Z0-9_.-]", "", str(body.get("user", "root"))) or "root"
+    password = str(body.get("password", ""))
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+        return JSONResponse({"error": "Некорректный IP"}, status_code=400)
+    if not (1 <= port <= 65535):
+        return JSONResponse({"error": "Некорректный порт"}, status_code=400)
+    if not password:
+        return JSONResponse({"error": "Требуется SSH-пароль SERVER-B"}, status_code=400)
+    ok, msg = await run_in_threadpool(_run_cascade, name, ip, port, user, password)
+    if ok:
+        _notify(f"🔗 <b>Каскад {name}</b>\nSERVER-B: <code>{ip}</code>\nРезультат: OK")
+        return {"ok": True, "message": msg}
+    _notify(f"❌ <b>Ошибка каскада {name}</b>\nSERVER-B: <code>{ip}</code>\n{msg[:300]}")
+    return JSONResponse({"error": msg}, status_code=500)
 
 @app.get("/api/protocols/config/{name}")
 async def api_proto_config(request: Request, name: str):

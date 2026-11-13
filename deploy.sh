@@ -307,6 +307,7 @@ SCRIPTS_TO_DOWNLOAD=(
     amnezia-server-install.sh
     amnezia-backup.sh
     amnezia-restore-b.sh
+    amnezia-cascade-setup.sh
 )
 
 MIRRORS=(

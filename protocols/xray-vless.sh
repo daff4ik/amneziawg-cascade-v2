@@ -217,6 +217,73 @@ do_clients() {
     done < "$CLIENTS_FILE"
 }
 
+# === Каскад A → B: локальный xray заворачивает трафик в xray на SERVER-B ===
+# Использование: SSHPASS='<пароль>' $0 cascade <IP B> [ssh-порт] [ssh-пользователь]
+do_cascade() {
+    local B_IP="$1" B_SSH_PORT="${2:-22}" B_USER="${3:-root}"
+    [[ -f "$STATE_FILE" ]] || { err "Сначала установите: $0 install"; exit 1; }
+    [[ -n "${SSHPASS:-}" ]] || { err "Нужен пароль SERVER-B в переменной SSHPASS"; exit 1; }
+    command -v sshpass >/dev/null || { apt update -qq < /dev/null && apt install -y -qq sshpass < /dev/null; }
+    export SSHPASS
+    run_b() { sshpass -e ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=15 -p "$B_SSH_PORT" "$B_USER@$B_IP" "$@"; }
+    run_b "echo SSH_OK" | grep -q SSH_OK || { err "SSH до $B_IP не работает"; exit 1; }
+
+    echo "Установка xray на SERVER-B ($B_IP)..."
+    sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -P "$B_SSH_PORT" "$0" "$B_USER@$B_IP:/usr/local/bin/amnezia-proto-xray-vless.sh"
+    run_b "chmod +x /usr/local/bin/amnezia-proto-xray-vless.sh && \
+        ENDPOINT_HOST=$B_IP /usr/local/bin/amnezia-proto-xray-vless.sh install" \
+        || { err "Не удалось установить xray на SERVER-B"; exit 1; }
+
+    # Параметры сервера B из его state-файла
+    local B_STATE
+    B_STATE=$(run_b "cat /etc/amnezia-protocols/xray-vless.conf")
+    local B_UUID B_XPORT B_SNI B_PUB B_SID
+    B_UUID=$(grep -oP '^UUID="\K[^"]+' <<< "$B_STATE")
+    B_XPORT=$(grep -oP '^PORT="\K[^"]+' <<< "$B_STATE")
+    B_SNI=$(grep -oP '^SNI="\K[^"]+' <<< "$B_STATE")
+    B_PUB=$(grep -oP '^PUBLIC_KEY="\K[^"]+' <<< "$B_STATE")
+    B_SID=$(grep -oP '^SHORT_ID="\K[^"]+' <<< "$B_STATE")
+    [[ -n "$B_UUID" && -n "$B_PUB" ]] || { err "Не удалось получить параметры xray с SERVER-B"; exit 1; }
+
+    # Исходящее подключение A → B (xray на A становится клиентом B)
+    python3 - "$XRAY_CONF" "$B_IP" "$B_XPORT" "$B_UUID" "$B_SNI" "$B_PUB" "$B_SID" <<'PY'
+import json, sys
+p, ip, port, uid, sni, pub, sid = sys.argv[1:8]
+c = json.load(open(p))
+c["outbounds"] = [{
+    "protocol": "vless", "tag": "proxy",
+    "settings": {"vnext": [{"address": ip, "port": int(port),
+        "users": [{"id": uid, "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
+    "streamSettings": {"network": "tcp", "security": "reality",
+        "realitySettings": {"serverName": sni, "publicKey": pub, "shortId": sid, "fingerprint": "chrome"}}
+}]
+json.dump(c, open(p, "w"), indent=2)
+PY
+    systemctl restart xray
+    sleep 1
+    systemctl is-active --quiet xray || { err "xray не запустился после настройки каскада"; exit 1; }
+    sed -i '/^CASCADE=/d' "$STATE_FILE"
+    echo "CASCADE=\"$B_IP\"" >> "$STATE_FILE"
+    ok "Каскад настроен: клиенты → этот сервер → $B_IP → интернет"
+}
+
+do_direct() {
+    [[ -f "$STATE_FILE" ]] || { err "Не установлен"; exit 1; }
+    python3 - "$XRAY_CONF" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["outbounds"] = [{"protocol": "freedom", "tag": "direct"}]
+json.dump(c, open(p, "w"), indent=2)
+PY
+    systemctl restart xray
+    sed -i '/^CASCADE=/d' "$STATE_FILE"
+    echo 'CASCADE=""' >> "$STATE_FILE"
+    ok "Каскад отключён — прямое подключение (xray на SERVER-B оставлен, удалите его там при желании)"
+}
+
 do_status() {
     if [[ -f "$STATE_FILE" ]]; then
         source "$STATE_FILE"
@@ -226,6 +293,7 @@ do_status() {
         echo "title=$TITLE"
         echo "port=$PORT"
         echo "link=$CLIENT_LINK"
+        echo "cascade=${CASCADE:-}"
         echo "clients_api=1"
         echo "clients=$(grep -c . "$CLIENTS_FILE" 2>/dev/null || echo 0)"
     else
@@ -237,9 +305,11 @@ do_status() {
 case "${1:-status}" in
     install) do_install ;;
     remove)  do_remove ;;
+    cascade) [[ -n "${2:-}" ]] || { err "Укажите IP SERVER-B: SSHPASS=... $0 cascade <IP> [ssh-порт] [пользователь]"; exit 1; }; do_cascade "$2" "${3:-22}" "${4:-root}" ;;
+    direct)  do_direct ;;
     add-client)    [[ -n "${2:-}" ]] || { err "Укажите имя: $0 add-client <имя>"; exit 1; }; do_add_client "$2" ;;
     remove-client) [[ -n "${2:-}" ]] || { err "Укажите имя: $0 remove-client <имя>"; exit 1; }; do_remove_client "$2" ;;
     clients)  do_clients ;;
     status)  do_status ;;
-    *) echo "Использование: $0 install|remove|status|clients|add-client <имя>|remove-client <имя>"; exit 1 ;;
+    *) echo "Использование: $0 install|remove|status|clients|add-client <имя>|remove-client <имя>|cascade <IP B>|direct"; exit 1 ;;
 esac
