@@ -28,7 +28,10 @@ for arg in "$@"; do
 done
 
 # ==================== Константы ====================
-REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main"
+REPO_URL="https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
+
+# Режим установки: 1 = только SERVER-A, 2 = только SERVER-B (панель на A), 3 = каскад A+B
+INSTALL_MODE=3
 
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_TUNNEL_PORT="8443"
@@ -63,6 +66,7 @@ write_cascade_env() {
     cat > "$CASCADE_ENV" <<EOF
 # AmneziaWG Cascade — общие константы.
 # Пишет deploy.sh, читают helper-скрипты и веб-панель.
+INSTALL_MODE="$INSTALL_MODE"
 AWG_TUNNEL_PORT="$AWG_TUNNEL_PORT"
 AWG_CLIENT_PORT="$AWG_CLIENT_PORT"
 TUNNEL_A_IP="$TUNNEL_A_IP"
@@ -80,6 +84,9 @@ SERVER_B_IP="${SERVER_B_IP:-${DE_IP:-}}"
 SERVER_B_PORT="${SERVER_B_PORT:-${DE_SSH_PORT:-22}}"
 SERVER_B_USER="${SERVER_B_USER:-${DE_SSH_USER:-root}}"
 SERVER_B_IFACE="${SERVER_B_IFACE:-${DE_IFACE:-}}"
+BACKUP_HOST="${BACKUP_HOST:-}"
+BACKUP_PORT="${BACKUP_PORT:-22}"
+BACKUP_USER="${BACKUP_USER:-root}"
 IPV6_ENABLED="$IPV6_ENABLED"
 TUNNEL_A_IP6="$TUNNEL_A_IP6"
 TUNNEL_B_IP6="$TUNNEL_B_IP6"
@@ -180,6 +187,7 @@ else
 
         [[ -f "$CASCADE_ENV" ]] || { err "В бэкапе нет $CASCADE_ENV"; exit 1; }
         source "$CASCADE_ENV"
+        [[ "${INSTALL_MODE:-3}" == "3" ]] || { err "--restore в v3 поддерживается только для каскадного режима (INSTALL_MODE=3)"; exit 1; }
 
         RU_IP=$(hostname -I | awk '{print $1}')
         read -p "IP-адрес этого сервера (новый SERVER-A) [$RU_IP]: " RU_IP_INPUT
@@ -196,14 +204,18 @@ else
         INSTALL_F2B=y
         ok "Параметры из бэкапа: сервер '$SERVER_NAME', endpoint $ENDPOINT_HOST, IPv6 $([[ "$IPV6_ENABLED" == "1" ]] && echo вкл || echo выкл)"
     else
+    echo "Режимы установки:"
+    echo "  1) Только SERVER-A      — протоколы и веб-панель на этом сервере"
+    echo "  2) Только SERVER-B      — протоколы на втором сервере, веб-панель и управление здесь (на A)"
+    echo "  3) Каскад A+B           — клиенты → SERVER-A → SERVER-B, веб-панель на A (максимальная скрытность B)"
+    read -p "Ваш выбор [3]: " INSTALL_MODE
+    INSTALL_MODE="${INSTALL_MODE:-3}"
+    [[ "$INSTALL_MODE" =~ ^[123]$ ]] || { err "Неверный режим: $INSTALL_MODE"; exit 1; }
+
     read -p "IP-адрес этого сервера (SERVER-A): " RU_IP
     [[ -z "$RU_IP" ]] && { err "IP обязателен"; exit 1; }
 
-    read -p "Домен для Endpoint в клиентских конфигах (Enter = использовать IP $RU_IP): " ENDPOINT_HOST
-    ENDPOINT_HOST="${ENDPOINT_HOST:-$RU_IP}"
-    ENDPOINT_HOST=$(echo "$ENDPOINT_HOST" | sed 's/[^a-zA-Z0-9.-]//g')
-    [[ -z "$ENDPOINT_HOST" ]] && ENDPOINT_HOST="$RU_IP"
-
+    if [[ "$INSTALL_MODE" != "1" ]]; then
     read -p "IP-адрес второго сервера (SERVER-B): " DE_IP
     [[ -z "$DE_IP" ]] && { err "IP обязателен"; exit 1; }
 
@@ -215,20 +227,35 @@ else
 
     read -r -s -p "SSH-пароль SERVER-B: " DE_PASS; echo
     [[ -z "$DE_PASS" ]] && { err "Пароль обязателен"; exit 1; }
+    fi
+
+    # Endpoint — адрес, к которому подключаются клиенты:
+    # режим 2 — напрямую к SERVER-B, режимы 1/3 — к SERVER-A
+    if [[ "$INSTALL_MODE" == "2" ]]; then EP_DEFAULT="$DE_IP"; else EP_DEFAULT="$RU_IP"; fi
+    read -p "Домен для Endpoint в клиентских конфигах (Enter = использовать IP $EP_DEFAULT): " ENDPOINT_HOST
+    ENDPOINT_HOST="${ENDPOINT_HOST:-$EP_DEFAULT}"
+    ENDPOINT_HOST=$(echo "$ENDPOINT_HOST" | sed 's/[^a-zA-Z0-9.-]//g')
+    [[ -z "$ENDPOINT_HOST" ]] && ENDPOINT_HOST="$EP_DEFAULT"
 
     read -p "Название сервера для AmneziaVPN (например, 'MyVPN'): " SERVER_NAME
     SERVER_NAME="${SERVER_NAME:-AmneziaVPN}"
 
-    read -p "Установить веб-панель? (y/n) [n]: " INSTALL_PANEL
-    INSTALL_PANEL="${INSTALL_PANEL:-n}"
+    read -p "Установить веб-панель на SERVER-A? (y/n) [y]: " INSTALL_PANEL
+    INSTALL_PANEL="${INSTALL_PANEL:-y}"
 
-    read -p "Установить Fail2Ban на оба сервера (защита от брутфорса)? (y/n) [y]: " INSTALL_F2B
+    if [[ "$INSTALL_MODE" == "1" ]]; then
+        read -p "Установить Fail2Ban (защита от брутфорса)? (y/n) [y]: " INSTALL_F2B
+    else
+        read -p "Установить Fail2Ban на оба сервера (защита от брутфорса)? (y/n) [y]: " INSTALL_F2B
+    fi
     INSTALL_F2B="${INSTALL_F2B:-y}"
 
-    # Stealth сразу при установке: если Endpoint — домен, прячем панель за него
+    # Stealth сразу при установке: если Endpoint — домен, прячем панель за него.
+    # В режиме 2 домен указывает на SERVER-B, а панель на A — stealth настраивается
+    # позже отдельным доменом (deploy --update).
     SETUP_STEALTH=n
     STEALTH_SECRET=""
-    if [[ ! "$ENDPOINT_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
+    if [[ "$INSTALL_MODE" != "2" && ! "$ENDPOINT_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$INSTALL_PANEL" =~ ^[yYдД] ]]; then
         echo ""
         echo "Убедитесь, что A-запись домена $ENDPOINT_HOST уже указывает на $RU_IP — иначе SSL не выпустится."
         read -p "Спрятать веб-панель за доменом $ENDPOINT_HOST сразу (stealth-режим)? (y/n) [y]: " SETUP_STEALTH
@@ -281,9 +308,9 @@ SCRIPTS_TO_DOWNLOAD=(
 )
 
 MIRRORS=(
-    "https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main"
-    "https://ghproxy.net/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main"
-    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/main"
+    "https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
+    "https://ghproxy.net/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
+    "https://mirror.ghproxy.com/https://raw.githubusercontent.com/daff4ik/amneziawg-cascade-v2/v3"
 )
 
 # Запоминаем первое рабочее зеркало, чтобы не перебирать все для каждого файла
@@ -326,6 +353,7 @@ INSTALL_FLAGS=()
 #  Полная установка: SSH до SERVER-B, IPv6, туннели
 # =====================================================================
 if [[ $UPDATE_MODE -eq 0 ]]; then
+    if [[ "$INSTALL_MODE" != "1" ]]; then
     say "Установка sshpass и проверка SSH до SERVER-B"
     command -v sshpass >/dev/null || { apt update -qq < /dev/null && apt install -y -qq sshpass < /dev/null; }
     export SSHPASS="$DE_PASS"
@@ -343,31 +371,42 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
 
     run_de "echo SSH_OK" | grep -q SSH_OK || { err "SSH до $DE_IP не работает"; exit 1; }
     ok "SSH работает"
+    fi
 
-    # --- Определение доступности IPv6 на SERVER-B ---
+    # --- Определение доступности IPv6 на выходном узле ---
+    # Режим 1: выходной узел — A. Режимы 2/3: выходной узел — B.
     if [[ $RESTORE_MODE -eq 1 ]]; then
         # Восстановление: параметры берём из бэкапа, SERVER-B не трогаем
         [[ "$IPV6_ENABLED" == "1" ]] && IPV6_ENABLED=1 || IPV6_ENABLED=0
         [[ $IPV6_ENABLED -eq 1 ]] && INSTALL_FLAGS+=(--ipv6)
     else
-    say "Проверка IPv6 на SERVER-B"
-    if run_de "ip -6 route show default 2>/dev/null | grep -q '^default'"; then
-        read -p "На SERVER-B есть выход в IPv6. Включить IPv6 в туннеле? (y/n) [y]: " V6_ANS
+    if [[ "$INSTALL_MODE" == "1" ]]; then
+        EXITNODE_DESC="SERVER-A"
+        exitnode_has_v6() { ip -6 route show default 2>/dev/null | grep -q '^default'; }
+    else
+        EXITNODE_DESC="SERVER-B"
+        exitnode_has_v6() { run_de "ip -6 route show default 2>/dev/null | grep -q '^default'"; }
+    fi
+    say "Проверка IPv6 на $EXITNODE_DESC"
+    if exitnode_has_v6; then
+        read -p "На $EXITNODE_DESC есть выход в IPv6. Включить IPv6? (y/n) [y]: " V6_ANS
         V6_ANS="${V6_ANS:-y}"
         [[ "$V6_ANS" =~ ^[yYдД] ]] && IPV6_ENABLED=1
     else
-        echo "IPv6 на SERVER-B не обнаружен — туннель будет только IPv4."
+        echo "IPv6 на $EXITNODE_DESC не обнаружен — будет только IPv4."
     fi
     [[ $IPV6_ENABLED -eq 1 ]] && INSTALL_FLAGS+=(--ipv6) && ok "IPv6 включён"
     fi
 
-    # --- Установка AmneziaWG на оба сервера (единый скрипт) ---
+    # --- Установка AmneziaWG (единый скрипт) ---
+    if [[ "$INSTALL_MODE" != "2" ]]; then
     say "Установка AmneziaWG на SERVER-A"
     # </dev/null: apt/debconf внутри не должен вычитывать ответы из stdin установщика
     bash /tmp/amnezia-server-install.sh "${INSTALL_FLAGS[@]}" < /dev/null
     ok "AmneziaWG на SERVER-A готов"
+    fi
 
-    if [[ $RESTORE_MODE -eq 0 ]]; then
+    if [[ $RESTORE_MODE -eq 0 && "$INSTALL_MODE" != "1" ]]; then
     say "Установка AmneziaWG на SERVER-B ($DE_IP)"
     scp_de /tmp/amnezia-server-install.sh /tmp/amnezia-server-install.sh
     run_de "bash /tmp/amnezia-server-install.sh ${INSTALL_FLAGS[*]}; rm -f /tmp/amnezia-server-install.sh"
@@ -382,14 +421,14 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
         say "Проверка поддержки IPv6 модулем AmneziaWG"
         V6_CHECK='ip link add _v6chk type amneziawg 2>/dev/null && ip -6 addr add fd00::1/128 dev _v6chk 2>/dev/null && ip link set mtu 1280 up dev _v6chk 2>/dev/null && ip -6 route add fd00::2/128 dev _v6chk 2>/dev/null && ip -6 addr show dev _v6chk 2>/dev/null | grep -q "fd00::1"'
         V6_OK=1
-        bash -c "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0
-        run_de "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0
+        [[ "$INSTALL_MODE" != "2" ]] && { bash -c "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0; }
+        [[ "$INSTALL_MODE" != "1" ]] && { run_de "$V6_CHECK; r=\$?; ip link del _v6chk 2>/dev/null; exit \$r" || V6_OK=0; }
         if [[ $V6_OK -eq 0 ]]; then
-            warn "Модуль AmneziaWG на одном из серверов не поддерживает IPv6"
-            warn "— продолжаю без IPv6 (клиенты останутся на IPv4, NAT44 на SERVER-B)."
+            warn "Модуль AmneziaWG не поддерживает IPv6 на нужном сервере"
+            warn "— продолжаю без IPv6 (клиенты останутся на IPv4, NAT44)."
             IPV6_ENABLED=0
         else
-            ok "IPv6 поддерживается обоими серверами"
+            ok "IPv6 поддерживается"
             # Минимальный MTU для IPv6 — 1280 (RFC 8200)
             MTU_AWG0=1280
             MTU_AWG1=1280
@@ -398,6 +437,7 @@ if [[ $UPDATE_MODE -eq 0 ]]; then
     fi
 
     # --- Общий файл констант для скриптов и панели ---
+    [[ "$INSTALL_MODE" == "3" ]] && BACKUP_HOST="$DE_IP"
     write_cascade_env
 
     say "Генерация параметров обфускации"
@@ -446,23 +486,27 @@ H4=$h4
 EOF
     }
 
-    eval "$(gen_obf)"                 # параметры awg0 (туннель A<->B)
+    eval "$(gen_obf)"                 # параметры awg0 (туннель A<->B, режим 3)
     eval "$(gen_obf | sed 's/^/C_/')" # параметры awg1 (клиенты), префикс C_
     ok "Параметры сгенерированы"
 
     say "Генерация ключей"
-    mkdir -p "$AWG_DIR" && chmod 700 "$AWG_DIR"
-    cd "$AWG_DIR"
-    if [[ ! -f private.key ]]; then
-        umask 077
-        awg genkey > private.key
-        awg pubkey < private.key > public.key
-        chmod 600 private.key
-        chmod 644 public.key
+    # Ключи awg0 живут там, где поднимается туннель (режим 3 — оба сервера)
+    if [[ "$INSTALL_MODE" != "2" ]]; then
+        mkdir -p "$AWG_DIR" && chmod 700 "$AWG_DIR"
+        cd "$AWG_DIR"
+        if [[ ! -f private.key ]]; then
+            umask 077
+            awg genkey > private.key
+            awg pubkey < private.key > public.key
+            chmod 600 private.key
+            chmod 644 public.key
+        fi
+        RU_PRIV=$(cat private.key)
+        RU_PUB=$(cat public.key)
     fi
-    RU_PRIV=$(cat private.key)
-    RU_PUB=$(cat public.key)
 
+    if [[ "$INSTALL_MODE" != "1" ]]; then
     run_de "mkdir -p $AWG_DIR && chmod 700 $AWG_DIR && cd $AWG_DIR && \
         if [ ! -f private.key ]; then umask 077; awg genkey > private.key; awg pubkey < private.key > public.key; chmod 600 private.key; chmod 644 public.key; fi"
     DE_PRIV=$(run_de "cat $AWG_DIR/private.key")
@@ -471,6 +515,13 @@ EOF
     DE_IFACE=$(run_de "ip route get 8.8.8.8 | awk '{print \$5}' | head -1")
     [[ -z "$DE_IFACE" ]] && { err "Не удалось определить внешний интерфейс SERVER-B"; exit 1; }
     ok "Внешний интерфейс SERVER-B: $DE_IFACE"
+    fi
+
+    if [[ "$INSTALL_MODE" == "1" ]]; then
+        RU_IFACE=$(ip route get 8.8.8.8 | awk '{print $5}' | head -1)
+        [[ -z "$RU_IFACE" ]] && { err "Не удалось определить внешний интерфейс SERVER-A"; exit 1; }
+        ok "Внешний интерфейс SERVER-A: $RU_IFACE"
+    fi
 
     # --- IPv6-фрагменты конфигов (пустые, если v6 выключен) ---
     A_V6_ADDR=""; A_V6_POSTUP=""; A_V6_POSTDOWN=""; A_V6_ALLOWED=""
@@ -509,6 +560,35 @@ PostDown = ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPM
         AWG1_V6_ADDR="Address = ${CLIENT_SUBNET6}::1/64"
     fi
 
+    # --- Правила прямого выхода в интернет (режимы 1 и 2: без туннеля) ---
+    AWG1_DIRECT_UP=""
+    AWG1_DIRECT_DOWN=""
+    if [[ "$INSTALL_MODE" != "3" ]]; then
+        if [[ "$INSTALL_MODE" == "1" ]]; then EXIT_IFACE="$RU_IFACE"; else EXIT_IFACE="$DE_IFACE"; fi
+        AWG1_DIRECT_UP="PostUp = iptables -A FORWARD -i awg1 -j ACCEPT
+PostUp = iptables -A FORWARD -o awg1 -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o $EXIT_IFACE -j MASQUERADE
+PostUp = while iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_CLAMP 2>/dev/null; do :; done
+PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_CLAMP"
+        AWG1_DIRECT_DOWN="PostDown = iptables -D FORWARD -i awg1 -j ACCEPT
+PostDown = iptables -D FORWARD -o awg1 -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o $EXIT_IFACE -j MASQUERADE
+PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_CLAMP 2>/dev/null || true"
+        if [[ $IPV6_ENABLED -eq 1 ]]; then
+            AWG1_DIRECT_UP="$AWG1_DIRECT_UP
+PostUp = ip6tables -A FORWARD -i awg1 -j ACCEPT
+PostUp = ip6tables -A FORWARD -o awg1 -j ACCEPT
+PostUp = ip6tables -t nat -A POSTROUTING -o $EXIT_IFACE -j MASQUERADE
+PostUp = ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_CLAMP"
+            AWG1_DIRECT_DOWN="$AWG1_DIRECT_DOWN
+PostDown = ip6tables -D FORWARD -i awg1 -j ACCEPT
+PostDown = ip6tables -D FORWARD -o awg1 -j ACCEPT
+PostDown = ip6tables -t nat -D POSTROUTING -o $EXIT_IFACE -j MASQUERADE
+PostDown = ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $MSS_CLAMP 2>/dev/null || true"
+        fi
+    fi
+
+    if [[ "$INSTALL_MODE" == "3" ]]; then
     say "Настройка туннеля awg0"
     cat > "$AWG_DIR/awg0.conf" <<EOF
 [Interface]
@@ -638,10 +718,16 @@ EOF
         err "Пинг до SERVER-B через туннель не идёт"
         exit 1
     fi
+    fi   # конец блока режима 3 (туннель awg0)
 
     say "Настройка клиентского интерфейса awg1"
     if [[ $RESTORE_MODE -eq 1 ]]; then
         ok "awg1.conf восстановлен из бэкапа — генерация не требуется"
+    else
+    # Ключи awg1 живут там, где слушает клиентский интерфейс (режим 2 — на B)
+    if [[ "$INSTALL_MODE" == "2" ]]; then
+        run_de "cd $AWG_DIR && if [ ! -f awg1_private.key ]; then umask 077; awg genkey > awg1_private.key; awg pubkey < awg1_private.key > awg1_public.key; chmod 600 awg1_private.key; chmod 644 awg1_public.key; fi"
+        AWG1_PRIV=$(run_de "cat $AWG_DIR/awg1_private.key" | tr -d '\r')
     else
     if [[ ! -f "$AWG_DIR/awg1_private.key" ]]; then
         umask 077
@@ -651,8 +737,9 @@ EOF
         chmod 644 "$AWG_DIR/awg1_public.key"
     fi
     AWG1_PRIV=$(cat "$AWG_DIR/awg1_private.key")
+    fi
 
-    cat > "$AWG_DIR/awg1.conf" <<EOF
+    cat > /tmp/awg1-gen.conf <<EOF
 [Interface]
 PrivateKey = $AWG1_PRIV
 Address = $CLIENT_SERVER_IP/24
@@ -679,14 +766,28 @@ KeepaliveTimeout = 5-15
 MaxHandshakeAttempts = 15-20
 RandomTrailers = on
 DisableCookies = on
+$AWG1_DIRECT_UP
+$AWG1_DIRECT_DOWN
 EOF
-    chmod 600 "$AWG_DIR/awg1.conf"
+
+    if [[ "$INSTALL_MODE" == "2" ]]; then
+        scp_de /tmp/awg1-gen.conf "$AWG_DIR/awg1.conf"
+        run_de "chmod 600 $AWG_DIR/awg1.conf && systemctl enable awg-quick@awg1 && systemctl restart awg-quick@awg1"
+        rm -f /tmp/awg1-gen.conf
+        ok "awg1 поднят на SERVER-B"
+    else
+        cp /tmp/awg1-gen.conf "$AWG_DIR/awg1.conf"
+        rm -f /tmp/awg1-gen.conf
+        chmod 600 "$AWG_DIR/awg1.conf"
+    fi
     fi
 
+    if [[ "$INSTALL_MODE" != "2" ]]; then
     systemctl enable awg-quick@awg1
     systemctl restart awg-quick@awg1
     sleep 2
     ok "awg1 поднят"
+    fi
 
     # Восстановление пиров из /root/clients (awg1.conf пересоздан, а конфиги клиентов сохранились)
     PEERS_RESTORED=0
@@ -727,22 +828,50 @@ fi
 
 # =====================================================================
 #  Установка helper-скриптов
+#  Режимы 1/3 — протоколы на SERVER-A: скрипты локально.
+#  Режим 2 — протоколы на SERVER-B: скрипты на B, на A только управляющие.
 # =====================================================================
 say "Установка helper-скриптов"
-mkdir -p /root/clients && chmod 700 /root/clients
 mkdir -p /usr/local/bin
 
-for script in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
-    if [[ -f "/tmp/$script" ]]; then
-        sed -e "s|__SERVER_ENDPOINT__|$(sed_escape "$ENDPOINT_HOST:$AWG_CLIENT_PORT")|g" \
-            -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
-            -e "s|__CLIENT_MTU__|$CLIENT_MTU|g" \
-            -e "s|__DNS_SERVERS__|$(sed_escape "$CLIENT_DNS")|g" \
-            "/tmp/$script" > "/usr/local/bin/$script"
-        chmod +x "/usr/local/bin/$script"
-    fi
-done
-ok "Скрипты установлены в /usr/local/bin/"
+# Скрипты, нужные на сервере с веб-панелью (A) в режиме 2
+PANEL_SIDE_SCRIPTS=(amnezia-panel-access.sh amnezia-restore-b.sh amnezia-notify.sh amnezia-notify-setup.sh)
+
+install_script_local() {
+    sed -e "s|__SERVER_ENDPOINT__|$(sed_escape "$ENDPOINT_HOST:$AWG_CLIENT_PORT")|g" \
+        -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
+        -e "s|__CLIENT_MTU__|$CLIENT_MTU|g" \
+        -e "s|__DNS_SERVERS__|$(sed_escape "$CLIENT_DNS")|g" \
+        "/tmp/$1" > "/usr/local/bin/$1"
+    chmod +x "/usr/local/bin/$1"
+}
+
+if [[ "$INSTALL_MODE" == "2" && $UPDATE_MODE -eq 0 ]]; then
+    # Все helper-скрипты — на SERVER-B
+    for script in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
+        if [[ -f "/tmp/$script" ]]; then
+            sed -e "s|__SERVER_ENDPOINT__|$(sed_escape "$ENDPOINT_HOST:$AWG_CLIENT_PORT")|g" \
+                -e "s|__SERVER_NAME__|$(sed_escape "$SERVER_NAME")|g" \
+                -e "s|__CLIENT_MTU__|$CLIENT_MTU|g" \
+                -e "s|__DNS_SERVERS__|$(sed_escape "$CLIENT_DNS")|g" \
+                "/tmp/$script" > "/tmp/_inst_$script"
+            scp_de "/tmp/_inst_$script" "/usr/local/bin/$script"
+            run_de "chmod +x /usr/local/bin/$script; mkdir -p /root/clients && chmod 700 /root/clients"
+            rm -f "/tmp/_inst_$script"
+        fi
+    done
+    # На SERVER-A — только управляющие скрипты
+    for script in "${PANEL_SIDE_SCRIPTS[@]}"; do
+        [[ -f "/tmp/$script" ]] && install_script_local "$script"
+    done
+    mkdir -p /root/clients && chmod 700 /root/clients
+else
+    mkdir -p /root/clients && chmod 700 /root/clients
+    for script in "${SCRIPTS_TO_DOWNLOAD[@]}"; do
+        [[ -f "/tmp/$script" ]] && install_script_local "$script"
+    done
+fi
+ok "Скрипты установлены"
 
 say "Настройка cron и ротации логов"
 mkdir -p /var/lib/amnezia-panel
@@ -760,6 +889,29 @@ cat > /etc/logrotate.d/amnezia <<'EOF'
 }
 EOF
 
+# healthcheck и сбор трафика — на сервере с протоколами (A в режимах 1/3, B в режиме 2)
+if [[ "$INSTALL_MODE" == "2" && $UPDATE_MODE -eq 0 ]]; then
+    run_de "cat > /etc/logrotate.d/amnezia <<'EOF'
+/var/log/amnezia-*.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+cat > /etc/cron.d/amnezia-healthcheck <<'EOF'
+0 * * * * root /usr/local/bin/amnezia-healthcheck.sh
+EOF
+cat > /etc/cron.d/amnezia-traffic <<'EOF'
+*/5 * * * * root /usr/local/bin/amnezia-traffic-collector.py
+EOF
+chmod 644 /etc/cron.d/amnezia-* /etc/logrotate.d/amnezia
+mkdir -p /var/lib/amnezia-panel
+[ -f /var/lib/amnezia-panel/traffic_enabled ] || echo 1 > /var/lib/amnezia-panel/traffic_enabled
+/usr/local/bin/amnezia-traffic-collector.py 2>/dev/null || true"
+else
 if [[ -x /usr/local/bin/amnezia-healthcheck.sh ]]; then
     cat > /etc/cron.d/amnezia-healthcheck <<'EOF'
 0 * * * * root /usr/local/bin/amnezia-healthcheck.sh
@@ -774,16 +926,47 @@ EOF
     chmod 644 /etc/cron.d/amnezia-traffic
     /usr/local/bin/amnezia-traffic-collector.py 2>/dev/null || true
 fi
+fi
 
-# === Ежедневный бэкап (локально + копия на SERVER-B по SSH-ключу) ===
-if [[ -x /usr/local/bin/amnezia-backup.sh ]]; then
+# === Ежедневный бэкап ===
+# Режим 1: только локально на A. Режим 3: локально на A + копия на B (ключ A→B).
+# Режим 2: бэкап делается на B, копия уходит на A (ключ B→A).
+if [[ "$INSTALL_MODE" == "2" && $UPDATE_MODE -eq 0 ]]; then
+    say "Настройка бэкапа на SERVER-B (копии прилетают на SERVER-A)"
+    # Константы для helper-скриптов на B (бэкап-копии уходят на A)
+    write_cascade_env
+    sed "s|^BACKUP_HOST=.*|BACKUP_HOST=\"$RU_IP\"|" "$CASCADE_ENV" > /tmp/_cascade_b.env
+    scp_de /tmp/_cascade_b.env "$CASCADE_ENV"
+    run_de "chmod 600 $CASCADE_ENV"
+    rm -f /tmp/_cascade_b.env
+
+    run_de "cat > /etc/cron.d/amnezia-backup <<'EOF'
+17 4 * * * root /usr/local/bin/amnezia-backup.sh
+EOF
+chmod 644 /etc/cron.d/amnezia-backup"
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
+    run_de "[[ -f /root/.ssh/id_ed25519 ]] || ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 -q; cat /root/.ssh/id_ed25519.pub" > /tmp/_b_pubkey
+    B_PUBKEY=$(cat /tmp/_b_pubkey | tr -d '\r'); rm -f /tmp/_b_pubkey
+    grep -qxF "$B_PUBKEY" /root/.ssh/authorized_keys 2>/dev/null || echo "$B_PUBKEY" >> /root/.ssh/authorized_keys \
+        && ok "SSH-ключ SERVER-B → SERVER-A установлен (для бэкапов)" \
+        || warn "Не удалось установить ключ — бэкап будет только локальным на B"
+    mkdir -p /root/amnezia-backups && chmod 700 /root/amnezia-backups
+
+    # SSH-ключ SERVER-A → SERVER-B для управления из веб-панели
+    [[ ! -f /root/.ssh/id_ed25519 ]] && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 -q
+    A_PUBKEY=$(cat /root/.ssh/id_ed25519.pub)
+    run_de "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && grep -qxF '$A_PUBKEY' /root/.ssh/authorized_keys || echo '$A_PUBKEY' >> /root/.ssh/authorized_keys" \
+        && ok "SSH-ключ SERVER-A → SERVER-B установлен (для панели)" \
+        || { err "Не удалось установить ключ A → B — панель не сможет управлять SERVER-B"; exit 1; }
+elif [[ "$INSTALL_MODE" != "2" && -x /usr/local/bin/amnezia-backup.sh ]]; then
     cat > /etc/cron.d/amnezia-backup <<'EOF'
 17 4 * * * root /usr/local/bin/amnezia-backup.sh
 EOF
     chmod 644 /etc/cron.d/amnezia-backup
 
     # SSH-ключ SERVER-A -> SERVER-B для отправки бэкапов (fresh и restore)
-    if [[ $UPDATE_MODE -eq 0 ]]; then
+    if [[ $UPDATE_MODE -eq 0 && "$INSTALL_MODE" == "3" ]]; then
         say "Настройка SSH-ключа для бэкапов на SERVER-B"
         [[ ! -f /root/.ssh/id_ed25519 ]] && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 -q
         A_PUBKEY=$(cat /root/.ssh/id_ed25519.pub)
@@ -796,10 +979,15 @@ ok "cron настроен"
 
 if [[ $UPDATE_MODE -eq 0 ]]; then
     say "Создание первого клиента (admin)"
+    if [[ "$INSTALL_MODE" == "2" ]]; then
+        run_de "[[ -f /root/clients/admin.conf ]] || echo n | /usr/local/bin/amnezia-add-client.sh admin" \
+            && ok "Клиент admin создан на SERVER-B" || warn "admin уже существует или создан"
+    else
     if [[ ! -f /root/clients/admin.conf ]] && [[ -x /usr/local/bin/amnezia-add-client.sh ]]; then
         echo "n" | /usr/local/bin/amnezia-add-client.sh admin || warn "admin уже существует или создан"
     else
         ok "Клиент admin уже существует"
+    fi
     fi
 fi
 
@@ -946,7 +1134,10 @@ fi
 #  Итоговый вывод
 # =====================================================================
 # === Первый бэкап — после полной настройки (включая панель) ===
-if [[ $UPDATE_MODE -eq 0 && -x /usr/local/bin/amnezia-backup.sh ]]; then
+if [[ $UPDATE_MODE -eq 0 && "$INSTALL_MODE" == "2" ]]; then
+    say "Создание первого бэкапа (на SERVER-B, копия прилетит сюда)"
+    run_de "/usr/local/bin/amnezia-backup.sh" || warn "Первый бэкап не удался — проверьте вручную на B: /usr/local/bin/amnezia-backup.sh"
+elif [[ $UPDATE_MODE -eq 0 && -x /usr/local/bin/amnezia-backup.sh ]]; then
     say "Создание первого бэкапа"
     /usr/local/bin/amnezia-backup.sh || warn "Первый бэкап не удался — проверьте вручную: /usr/local/bin/amnezia-backup.sh"
 fi
@@ -967,18 +1158,21 @@ SERVER-A восстановлен из бэкапа.
   Если Endpoint — домен, обновите его A-запись на $RU_IP.
 EOM
 else
+    MODE_DESC="Каскад A+B"
+    [[ "$INSTALL_MODE" == "1" ]] && MODE_DESC="Только SERVER-A"
+    [[ "$INSTALL_MODE" == "2" ]] && MODE_DESC="Только SERVER-B (панель на A)"
     cat <<EOM
 
-Каскадный VPN развёрнут.
+Каскадный VPN развёрнут. Режим: $MODE_DESC
 
   SERVER-A (этот): $RU_IP
-  SERVER-B:        $DE_IP
-  Туннель awg0:    порт $AWG_TUNNEL_PORT/udp
+$( [[ "$INSTALL_MODE" != "1" ]] && echo "  SERVER-B:        $DE_IP" )
+$( [[ "$INSTALL_MODE" == "3" ]] && echo "  Туннель awg0:    порт $AWG_TUNNEL_PORT/udp" )
   Клиенты awg1:    порт $AWG_CLIENT_PORT/udp
   Endpoint:        $ENDPOINT_HOST:$AWG_CLIENT_PORT
   Подсеть:         $CLIENT_SUBNET.0/24
   IPv6:            $([[ $IPV6_ENABLED -eq 1 ]] && echo "включён ($CLIENT_SUBNET6::/64)" || echo "выключен")
-  Fail2Ban:        $([[ "$INSTALL_F2B" =~ ^[yYдД] ]] && echo "на обоих серверах" || echo "не установлен")
+  Fail2Ban:        $([[ "$INSTALL_F2B" =~ ^[yYдД] ]] && echo "установлен" || echo "не установлен")
 EOM
 fi
 
