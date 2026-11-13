@@ -875,6 +875,13 @@ async function loadProtocols() {
         if (p.file) {
           body += `<a class="btn btn-small btn-primary" href="${BASE_URL}/api/protocols/config/${p.name}">⬇ Клиентский файл</a> `;
         }
+        if (p.name === 'amnezia-dns') {
+          body += `<div style="margin:0.5rem 0;">
+            <button class="btn btn-small btn-primary" onclick="protoAction('amnezia-dns','use-for-clients','переключение клиентов на свой DNS')">🔀 Клиентам — этот DNS</button>
+            <button class="btn btn-small" onclick="protoAction('amnezia-dns','use-cloudflare','возврат DNS Cloudflare')">↩️ Вернуть Cloudflare</button>
+          </div>
+          <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;">После переключения клиенты должны заново импортировать конфиг / vpn:// ссылку.</div>`;
+        }
         body += `<button class="btn btn-small btn-danger" onclick="protoAction('${p.name}','remove','${escapeHtml(p.title)}')">Удалить</button>`;
       } else {
         body = `<div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:0.5rem;">${escapeHtml(p.error || '')}</div>
@@ -890,12 +897,14 @@ async function loadProtocols() {
 
 async function protoAction(name, action, title) {
   if (action === 'remove' && !confirm(`Удалить ${title}?`)) return;
-  showLoader(action === 'install' ? `Установка ${title}... (может занять пару минут)` : `Удаление ${title}...`);
+  if (action.startsWith('use-') && !confirm(`${title}?\nКлиентам нужно будет заново импортировать конфиг / vpn:// ссылку.`)) return;
+  showLoader(action === 'install' ? `Установка ${title}... (может занять пару минут)` : `Выполнение: ${title}...`);
   try {
     const r = await fetch(BASE_URL + `/api/protocols/${action}/${name}`, {method:'POST', credentials:'same-origin'});
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'Ошибка');
     if (action === 'install' && d.link) alert('✅ Установлено!\n\nСсылка для подключения:\n' + d.link);
+    if (action.startsWith('use-')) alert('✅ Готово. Клиенты должны заново импортировать конфиг / vpn:// ссылку.');
   } catch(e) { alert('❌ ' + e.message); }
   finally { hideLoader(); loadProtocols(); }
 }
@@ -1338,8 +1347,10 @@ async def api_clients(request: Request):
     _clients_cache.update(ts=now, data=data)
     return JSONResponse(data)
 
-# --- API дополнительных протоколов (xray-vless, mtproxy, tor-site) ---
+# --- API дополнительных протоколов (xray-vless, mtproxy, tor-site и др.) ---
 PROTOCOLS = ["xray-vless", "mtproxy", "tor-site", "amnezia-dns", "openvpn", "ipsec", "wireguard"]
+# Дополнительные действия протоколов помимо install/remove
+PROTO_EXTRA_ACTIONS = {"amnezia-dns": ("use-for-clients", "use-cloudflare")}
 
 def _proto_status(name):
     ok, out, err = srv_exec(f"/usr/local/bin/amnezia-proto-{name}.sh status", timeout=15)
@@ -1363,7 +1374,8 @@ async def api_protocols(request: Request):
 @app.post("/api/protocols/{action}/{name}")
 async def api_proto_action(request: Request, action: str, name: str):
     current_user(request)
-    if name not in PROTOCOLS or action not in ("install", "remove"):
+    allowed = ("install", "remove") + PROTO_EXTRA_ACTIONS.get(name, ())
+    if name not in PROTOCOLS or action not in allowed:
         return JSONResponse({"error": "Неизвестная операция"}, status_code=400)
     ok, out, err = await run_in_threadpool(
         srv_exec, f"/usr/local/bin/amnezia-proto-{name}.sh {action}", 600)
