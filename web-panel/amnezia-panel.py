@@ -876,11 +876,16 @@ async function loadProtocols() {
           body += `<a class="btn btn-small btn-primary" href="${BASE_URL}/api/protocols/config/${p.name}">⬇ Клиентский файл</a> `;
         }
         if (p.name === 'amnezia-dns') {
+          const abOn = p.adblock === '1';
+          const abLabel = abOn
+            ? `🚫 Реклама: ВКЛ${p.adblock_domains ? ' (' + p.adblock_domains + ' доменов)' : ''} — выключить`
+            : '🚫 Реклама: ВЫКЛ — включить';
           body += `<div style="margin:0.5rem 0;">
             <button class="btn btn-small btn-primary" onclick="protoAction('amnezia-dns','use-for-clients','переключение клиентов на свой DNS')">🔀 Клиентам — этот DNS</button>
             <button class="btn btn-small" onclick="protoAction('amnezia-dns','use-cloudflare','возврат DNS Cloudflare')">↩️ Вернуть Cloudflare</button>
+            <button class="btn btn-small ${abOn ? '' : 'btn-primary'}" onclick="protoAction('amnezia-dns','${abOn ? 'adblock-off' : 'adblock-on'}','блокировка рекламы')">${abLabel}</button>
           </div>
-          <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;">После переключения клиенты должны заново импортировать конфиг / vpn:// ссылку.</div>`;
+          <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.5rem;">После переключения DNS клиенты должны заново импортировать конфиг / vpn:// ссылку. Блокировка рекламы применяется сразу.</div>`;
         }
         body += `<button class="btn btn-small btn-danger" onclick="protoAction('${p.name}','remove','${escapeHtml(p.title)}')">Удалить</button>`;
       } else {
@@ -1350,7 +1355,7 @@ async def api_clients(request: Request):
 # --- API дополнительных протоколов (xray-vless, mtproxy, tor-site и др.) ---
 PROTOCOLS = ["xray-vless", "mtproxy", "tor-site", "amnezia-dns", "openvpn", "ipsec", "wireguard"]
 # Дополнительные действия протоколов помимо install/remove
-PROTO_EXTRA_ACTIONS = {"amnezia-dns": ("use-for-clients", "use-cloudflare")}
+PROTO_EXTRA_ACTIONS = {"amnezia-dns": ("use-for-clients", "use-cloudflare", "adblock-on", "adblock-off")}
 
 def _proto_status(name):
     ok, out, err = srv_exec(f"/usr/local/bin/amnezia-proto-{name}.sh status", timeout=15)

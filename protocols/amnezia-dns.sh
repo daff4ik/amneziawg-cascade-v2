@@ -17,6 +17,9 @@ TITLE="Amnezia DNS (unbound)"
 STATE_DIR="/etc/amnezia-protocols"
 STATE_FILE="$STATE_DIR/$NAME.conf"
 UNBOUND_CONF="/etc/unbound/unbound.conf.d/amnezia.conf"
+ADBLOCK_CONF="/etc/unbound/unbound.conf.d/adblock.conf"
+ADBLOCK_CRON="/etc/cron.d/amnezia-dns-adblock"
+ADBLOCK_URL="https://big.oisd.nl/domainswild"
 
 ok()   { echo -e "\033[1;32m[OK]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
@@ -84,9 +87,49 @@ EOF
 
 do_remove() {
     systemctl disable --now unbound 2>/dev/null || true
-    rm -f "$UNBOUND_CONF" "$STATE_FILE"
+    rm -f "$UNBOUND_CONF" "$ADBLOCK_CONF" "$ADBLOCK_CRON" "$STATE_FILE"
     ok "$TITLE удалён (пакет unbound оставлен в системе)"
     echo "Не забудьте вернуть клиентам публичный DNS: $0 use-cloudflare"
+}
+
+# === Блокировка рекламы/трекеров (блок-лист oisd big) ===
+_adblock_write() {
+    echo "Скачивание блок-листа (oisd big)..."
+    curl -fsSL -m 90 "$ADBLOCK_URL" -o /tmp/adblock.list || { err "Не удалось скачать блок-лист"; return 1; }
+    {
+        echo "server:"
+        tr -d '\r' < /tmp/adblock.list | grep -vE '^\s*(#|$)' \
+            | sed 's/^/    local-zone: "/; s/$/" always_nxdomain/'
+    } > "$ADBLOCK_CONF"
+    rm -f /tmp/adblock.list
+    unbound-checkconf >/dev/null 2>&1 || { err "Ошибка в сгенерированном конфиге"; rm -f "$ADBLOCK_CONF"; return 1; }
+    systemctl reload unbound 2>/dev/null || systemctl restart unbound
+}
+
+do_adblock_on() {
+    [[ -f "$STATE_FILE" ]] || { err "Сначала установите: $0 install"; exit 1; }
+    _adblock_write || exit 1
+    cat > "$ADBLOCK_CRON" <<EOF
+23 5 * * 1 root /usr/local/bin/amnezia-proto-amnezia-dns.sh adblock-update
+EOF
+    chmod 644 "$ADBLOCK_CRON"
+    sed -i '/^AD_BLOCK=/d' "$STATE_FILE"
+    echo 'AD_BLOCK="1"' >> "$STATE_FILE"
+    ok "Блокировка рекламы включена ($(grep -c local-zone "$ADBLOCK_CONF") доменов, обновление — еженедельно)"
+}
+
+do_adblock_update() {
+    [[ -f "$STATE_FILE" ]] || exit 0
+    source "$STATE_FILE"
+    [[ "${AD_BLOCK:-0}" == "1" ]] || exit 0
+    _adblock_write
+}
+
+do_adblock_off() {
+    rm -f "$ADBLOCK_CONF" "$ADBLOCK_CRON"
+    [[ -f "$STATE_FILE" ]] && { sed -i '/^AD_BLOCK=/d' "$STATE_FILE"; echo 'AD_BLOCK="0"' >> "$STATE_FILE"; }
+    systemctl reload unbound 2>/dev/null || systemctl restart unbound 2>/dev/null || true
+    ok "Блокировка рекламы выключена"
 }
 
 # Переключение DNS в клиентских конфигах AmneziaWG (+ обновление vpn:// ссылок)
@@ -119,6 +162,9 @@ switch_clients_dns() {
 case "${1:-status}" in
     install) do_install ;;
     remove)  do_remove ;;
+    adblock-on)  do_adblock_on ;;
+    adblock-off) do_adblock_off ;;
+    adblock-update) do_adblock_update ;;
     use-for-clients)
         [[ -f "$STATE_FILE" ]] || { err "Сначала установите: $0 install"; exit 1; }
         switch_clients_dns "$DNS_IP" ;;
@@ -133,10 +179,13 @@ case "${1:-status}" in
             echo "title=$TITLE"
             echo "port=$PORT"
             echo "link=DNS для клиентов: $ADDRESS"
+            echo "adblock=${AD_BLOCK:-0}"
+            [[ "${AD_BLOCK:-0}" == "1" && -f "$ADBLOCK_CONF" ]] \
+                && echo "adblock_domains=$(grep -c local-zone "$ADBLOCK_CONF")"
         else
             echo "installed=0"
             echo "title=$TITLE"
         fi
         ;;
-    *) echo "Использование: $0 install|remove|status|use-for-clients|use-cloudflare"; exit 1 ;;
+    *) echo "Использование: $0 install|remove|status|use-for-clients|use-cloudflare|adblock-on|adblock-off"; exit 1 ;;
 esac
